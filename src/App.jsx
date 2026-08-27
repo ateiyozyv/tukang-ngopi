@@ -4098,6 +4098,27 @@ function DatabaseScreen({ db, persist, onBack, initialTab }) {
   const [importPreview, setImportPreview] = useState(null); // parsed db, menunggu konfirmasi
   const importFileRef = useRef(null);
 
+  // Aktivitas terakhir sebuah bean = yang paling baru di antara: kapan bean
+  // itu sendiri diedit/ditambah, kapan terakhir dipakai di trial Dial-In
+  // (recipes), atau kapan terakhir diseduh lewat Bikin Kopi (brews) — bukan
+  // cuma kapan data bean-nya diutak-atik.
+  const lastBeanActivity = (beanId, bean) => {
+    let latest = new Date(bean.updatedAt || bean.createdAt || 0).getTime();
+    db.recipes.forEach((r) => {
+      if (r.beanId === beanId) {
+        const t = new Date(r.date || 0).getTime();
+        if (t > latest) latest = t;
+      }
+    });
+    db.brews.forEach((br) => {
+      if (br.beanId === beanId) {
+        const t = new Date(br.date || 0).getTime();
+        if (t > latest) latest = t;
+      }
+    });
+    return latest;
+  };
+
   const rawItems = db[tab] || [];
   const items =
     tab === "recipes"
@@ -4106,8 +4127,8 @@ function DatabaseScreen({ db, persist, onBack, initialTab }) {
       ? rawItems.slice().sort((a, b) => {
           const stockDiff = (a.outOfStock ? 1 : 0) - (b.outOfStock ? 1 : 0);
           if (stockDiff !== 0) return stockDiff;
-          const aTime = new Date(a.updatedAt || a.createdAt || 0).getTime();
-          const bTime = new Date(b.updatedAt || b.createdAt || 0).getTime();
+          const aTime = lastBeanActivity(a.id, a);
+          const bTime = lastBeanActivity(b.id, b);
           return bTime - aTime;
         })
       : rawItems;
