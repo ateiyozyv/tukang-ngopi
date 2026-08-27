@@ -1841,6 +1841,8 @@ function beanToRow(b) {
     density: b.density || "",
     notes: b.notes || "",
     out_of_stock: !!b.outOfStock,
+    created_at: b.createdAt || new Date().toISOString(),
+    updated_at: b.updatedAt || new Date().toISOString(),
   };
 }
 function rowToBean(r) {
@@ -1855,6 +1857,8 @@ function rowToBean(r) {
     density: r.density,
     notes: r.notes,
     outOfStock: r.out_of_stock,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
   };
 }
 function grinderToRow(g) {
@@ -3434,6 +3438,7 @@ const DB_TABS = [
   { key: "grinders", label: "Grinder", icon: Cog, single: "Grinder" },
   { key: "machines", label: "Machine", icon: Cpu, single: "Machine" },
   { key: "history", label: "Recipe", icon: ClipboardList, single: "Recipe" },
+  { key: "brews", label: "Riwayat Seduh", icon: History, single: "Brew" },
 ];
 
 // Skala roast dengan swatch warna, biar lebih presisi daripada nulis bebas
@@ -3921,6 +3926,162 @@ function ShotHistoryPanel({ db, persist, onEdit }) {
   );
 }
 
+// ---------- Brew History (Riwayat Seduh) ----------
+function BrewHistoryPanel({ db, persist }) {
+  const [dateFilter, setDateFilter] = useState("all"); // all | 7d | 30d
+  const [beanFilter, setBeanFilter] = useState("all");
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+
+  const handleDelete = (id) => {
+    persist({ ...db, brews: db.brews.filter((b) => b.id !== id) });
+    setConfirmDeleteId(null);
+  };
+
+  const now = Date.now();
+  const dateCutoff =
+    dateFilter === "7d" ? now - 7 * 86400000 : dateFilter === "30d" ? now - 30 * 86400000 : null;
+
+  const entries = db.brews
+    .filter((b) => {
+      if (dateCutoff && (!b.date || new Date(b.date).getTime() < dateCutoff)) return false;
+      if (beanFilter !== "all" && b.beanId !== beanFilter) return false;
+      return true;
+    })
+    .slice()
+    .sort((a, b) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime());
+
+  const fmtDate = (iso) => {
+    if (!iso) return "Tanggal tidak diketahui";
+    const d = new Date(iso);
+    return (
+      d.toLocaleDateString("id-ID", { day: "numeric", month: "short", year: "numeric" }) +
+      " · " +
+      d.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" })
+    );
+  };
+
+  return (
+    <div className="px-5 mt-4">
+      <div className="flex gap-2 overflow-x-auto pb-1 no-scrollbar mb-2.5">
+        {[
+          { key: "all", label: "Semua Tanggal" },
+          { key: "7d", label: "7 Hari" },
+          { key: "30d", label: "30 Hari" },
+        ].map((opt) => (
+          <button
+            key={opt.key}
+            onClick={() => setDateFilter(opt.key)}
+            className="shrink-0 rounded-full px-3.5 py-2 text-xs"
+            style={{
+              backgroundColor: dateFilter === opt.key ? "#C69163" : "transparent",
+              color: dateFilter === opt.key ? "#332C2A" : "#6B6058",
+              border: `1px solid ${dateFilter === opt.key ? "#C69163" : "#DDD6CE"}`,
+              fontWeight: dateFilter === opt.key ? 600 : 400,
+            }}
+          >
+            {opt.label}
+          </button>
+        ))}
+      </div>
+
+      <div className="mb-4">
+        <CustomSelect
+          value={beanFilter}
+          onChange={setBeanFilter}
+          placeholder="Semua Bean"
+          options={[{ value: "all", label: "Semua Bean" }, ...db.beans.map((b) => ({ value: b.id, label: b.name }))]}
+        />
+      </div>
+
+      <div className="text-xs mb-2.5" style={{ color: "#736657" }}>
+        {entries.length} seduhan tercatat
+      </div>
+
+      {entries.length === 0 ? (
+        <EmptyState text="Belum ada riwayat seduh yang cocok sama filter ini." />
+      ) : (
+        <div className="space-y-2.5 pb-10">
+          {entries.map((b) => {
+            const bean = db.beans.find((x) => x.id === b.beanId);
+            const grinder = db.grinders.find((x) => x.id === b.grinderId);
+            const machine = db.machines.find((x) => x.id === b.machineId);
+            const recipe = b.recipeId ? db.recipes.find((r) => r.id === b.recipeId) : null;
+            return (
+              <div
+                key={b.id}
+                className="rounded-2xl px-4 py-3.5"
+                style={{ backgroundColor: "#F7F3EE", border: "1px solid #DDD6CE" }}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div
+                    className="text-sm min-w-0"
+                    style={{ fontFamily: "'IBM Plex Mono', monospace", fontWeight: 600, color: "#2A2118" }}
+                  >
+                    {bean?.name || "?"} · {machine ? `${machine.name} · ` : ""}
+                    {grinder?.name || "?"}
+                  </div>
+                  <button
+                    onClick={() => setConfirmDeleteId(b.id)}
+                    aria-label="Hapus"
+                    className="w-7 h-7 rounded-lg flex items-center justify-center shrink-0"
+                    style={{ color: "#B5493A", border: "1px solid #DDD6CE" }}
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                </div>
+                <div className="text-xs mt-1" style={{ color: "#6B6058" }}>
+                  {[
+                    b.size === "single" ? "Single" : b.size === "double" ? "Double" : null,
+                    recipe?.setting && `setting ${recipe.setting}`,
+                    b.feedback,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
+                </div>
+                <div className="text-[11px] mt-1.5" style={{ color: "#736657" }}>
+                  {fmtDate(b.date)}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {confirmDeleteId && (
+        <div
+          className="fixed inset-0 z-30 flex items-center justify-center px-6"
+          style={{ backgroundColor: "rgba(0,0,0,0.7)" }}
+        >
+          <div
+            className="w-full max-w-sm rounded-2xl p-5"
+            style={{ backgroundColor: "#F7F3EE", border: "1px solid #DDD6CE" }}
+          >
+            <p className="text-sm mb-4" style={{ color: "#2A2118" }}>
+              Hapus riwayat seduh ini permanen? Tindakan ini nggak bisa dibatalkan.
+            </p>
+            <div className="flex gap-3">
+              <button
+                onClick={() => setConfirmDeleteId(null)}
+                className="flex-1 rounded-xl py-2.5 text-sm"
+                style={{ border: "1px solid #DDD6CE", color: "#6B6058" }}
+              >
+                Batal
+              </button>
+              <button
+                onClick={() => handleDelete(confirmDeleteId)}
+                className="flex-1 rounded-xl py-2.5 text-sm font-semibold"
+                style={{ backgroundColor: "#B5493A", color: "#332C2A" }}
+              >
+                Hapus
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function DatabaseScreen({ db, persist, onBack, initialTab }) {
   const [tab, setTab] = useState(initialTab || "beans");
   const [formOpen, setFormOpen] = useState(false);
@@ -3942,7 +4103,13 @@ function DatabaseScreen({ db, persist, onBack, initialTab }) {
     tab === "recipes"
       ? rawItems.slice().sort((a, b) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime())
       : tab === "beans"
-      ? rawItems.slice().sort((a, b) => (a.outOfStock ? 1 : 0) - (b.outOfStock ? 1 : 0))
+      ? rawItems.slice().sort((a, b) => {
+          const stockDiff = (a.outOfStock ? 1 : 0) - (b.outOfStock ? 1 : 0);
+          if (stockDiff !== 0) return stockDiff;
+          const aTime = new Date(a.updatedAt || a.createdAt || 0).getTime();
+          const bTime = new Date(b.updatedAt || b.createdAt || 0).getTime();
+          return bTime - aTime;
+        })
       : rawItems;
 
   const handleExport = () => {
@@ -4045,11 +4212,18 @@ function DatabaseScreen({ db, persist, onBack, initialTab }) {
 
   const handleSave = (values) => {
     const list = db[formTabKey].slice();
+    const now = new Date().toISOString();
     if (editing) {
       const idx = list.findIndex((i) => i.id === editing.id);
-      list[idx] = { ...editing, ...values };
+      const extra = formTabKey === "beans" ? { updatedAt: now } : {};
+      list[idx] = { ...editing, ...values, ...extra };
     } else {
-      const extra = formTabKey === "recipes" ? { date: new Date().toISOString() } : {};
+      const extra =
+        formTabKey === "recipes"
+          ? { date: now }
+          : formTabKey === "beans"
+          ? { createdAt: now, updatedAt: now }
+          : {};
       list.push({ id: uid(), ...values, ...extra });
     }
     persist({ ...db, [formTabKey]: list });
@@ -4059,7 +4233,7 @@ function DatabaseScreen({ db, persist, onBack, initialTab }) {
 
   const toggleStock = (beanId) => {
     const list = db.beans.map((b) =>
-      b.id === beanId ? { ...b, outOfStock: !b.outOfStock } : b
+      b.id === beanId ? { ...b, outOfStock: !b.outOfStock, updatedAt: new Date().toISOString() } : b
     );
     persist({ ...db, beans: list });
   };
@@ -4217,7 +4391,7 @@ function DatabaseScreen({ db, persist, onBack, initialTab }) {
                 className="ml-0.5 text-[10px] rounded-full px-1.5"
                 style={{ backgroundColor: active ? "rgba(28,21,18,0.2)" : "#F0ECE7" }}
               >
-                {t.key === "history" ? db.recipes.length : db[t.key].length}
+                {t.key === "history" ? db.recipes.length : t.key === "brews" ? db.brews.length : db[t.key].length}
               </span>
             </button>
           );
@@ -4234,6 +4408,8 @@ function DatabaseScreen({ db, persist, onBack, initialTab }) {
             setFormOpen(true);
           }}
         />
+      ) : tab === "brews" ? (
+        <BrewHistoryPanel db={db} persist={persist} />
       ) : (
         <div className="px-5 mt-4 space-y-2.5">
           {items.length === 0 ? (
@@ -4344,18 +4520,20 @@ function DatabaseScreen({ db, persist, onBack, initialTab }) {
         </div>
       )}
 
-      <button
-        onClick={() => {
-          setFormTabKey(tab === "history" ? "recipes" : tab);
-          setEditing(null);
-          setFormOpen(true);
-        }}
-        className="fixed bottom-6 right-5 w-14 h-14 rounded-full shadow-lg flex items-center justify-center focus:outline-none"
-        style={{ backgroundColor: "#C69163", color: "#332C2A" }}
-        aria-label={`Tambah ${DB_TABS.find((t) => t.key === tab).single}`}
-      >
-        <Plus size={24} />
-      </button>
+      {tab !== "brews" && (
+        <button
+          onClick={() => {
+            setFormTabKey(tab === "history" ? "recipes" : tab);
+            setEditing(null);
+            setFormOpen(true);
+          }}
+          className="fixed bottom-6 right-5 w-14 h-14 rounded-full shadow-lg flex items-center justify-center focus:outline-none"
+          style={{ backgroundColor: "#C69163", color: "#332C2A" }}
+          aria-label={`Tambah ${DB_TABS.find((t) => t.key === tab).single}`}
+        >
+          <Plus size={24} />
+        </button>
+      )}
 
       {formOpen && (
         <ItemForm
