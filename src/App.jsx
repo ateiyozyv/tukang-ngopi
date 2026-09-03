@@ -277,6 +277,141 @@ function roundToStep(value, grinder) {
   return Math.round(value);
 }
 
+// Kalibrasi dari data pengguna: dose lebih kecil butuh grind lebih halus
+// buat jaga waktu ekstraksi target, dose lebih besar butuh lebih kasar.
+// Dihitung dari 2 pasangan data independen di grinder berbeda — keduanya
+// konsisten di angka yang sama meski step-size grinder beda jauh:
+// K64S: Robusta Fer 18g → setting 1,5 vs 10g → setting 1,0 (selisih 2 step
+//   K64S @0,25 untuk selisih 8g)
+// Breville: ADF Winey 18g → setting 4 vs (re-roast) 10g → setting 2
+//   (selisih 2 step Breville @1 untuk selisih 8g juga)
+// Keduanya = 0,25 "step grinder" per 4 gram dose → 0,0625 step per gram.
+const DOSE_STEP_PER_GRAM = 0.0625; // dalam satuan step grinder, per gram dose
+
+// Geser setting berdasarkan selisih dose dari dose asal recipe (baseDose)
+// ke target dose yang diminta. Return null kalau salah satu dose nggak
+// valid/nggak beda, biar caller tau nggak perlu nampilin penyesuaian.
+function doseAdjustSetting(baseSetting, baseDose, targetDose, grinder) {
+  if (baseDose == null || isNaN(baseDose) || targetDose == null || isNaN(targetDose)) return null;
+  if (Math.abs(baseDose - targetDose) < 0.5) return null;
+  const step = parseFloat(grinder?.stepSize) || 1;
+  const gramDiff = targetDose - baseDose;
+  const numericShift = gramDiff * DOSE_STEP_PER_GRAM * step;
+  const raw = baseSetting + numericShift;
+  return Math.round(roundToStep(raw, grinder) * 100) / 100;
+}
+
+// Dose nominal per pilihan ukuran di layar Bikin Kopi — dipakai buat
+// menyesuaikan setting prediksi kalau data recipe yang ada dosenya beda.
+const NOMINAL_DOSE_BY_SIZE = { single: 10, double: 18 };
+
+// Ukuran seduhan: single/double punya dose nominal tetap, "lain" pakai
+// angka custom yang diketik user. Dipakai di Bikin Kopi maupun Dial-In.
+function resolveTargetDose(size, customDose) {
+  if (size === "single") return NOMINAL_DOSE_BY_SIZE.single;
+  if (size === "double") return NOMINAL_DOSE_BY_SIZE.double;
+  if (size === "lain") {
+    const v = parseFloat(customDose);
+    return isNaN(v) ? null : v;
+  }
+  return null;
+}
+
+// Komponen pilihan Ukuran dipakai bareng di Bikin Kopi & Dial-In — 3 opsi:
+// Single (10g), Double (18g), atau Ukuran lain (custom, muncul input angka).
+function SizePicker({ size, setSize, customDose, setCustomDose, onContinue }) {
+  return (
+    <div className="px-5">
+      <div className="grid grid-cols-3 gap-2.5">
+        {["single", "double", "lain"].map((s) => (
+          <button
+            key={s}
+            onClick={() => setSize(s)}
+            className="rounded-2xl py-5 px-2 text-sm text-center"
+            style={{
+              backgroundColor: size === s ? "#C69163" : "#F7F3EE",
+              color: size === s ? "#332C2A" : "#2A2118",
+              border: `1px solid ${size === s ? "#C69163" : "#DDD6CE"}`,
+              fontWeight: 600,
+            }}
+          >
+            {s === "single" ? `Single\n~${NOMINAL_DOSE_BY_SIZE.single}g` : s === "double" ? `Double\n~${NOMINAL_DOSE_BY_SIZE.double}g` : "Ukuran lain"}
+          </button>
+        ))}
+      </div>
+
+      {size === "lain" && (
+        <div className="mt-4">
+          <Field label="Dose target (g)">
+            <input
+              className={inputCls} style={inputStyle}
+              placeholder="cth. 14"
+              inputMode="decimal"
+              value={customDose}
+              onChange={(e) => setCustomDose(e.target.value)}
+            />
+          </Field>
+        </div>
+      )}
+
+      <button
+        onClick={onContinue}
+        disabled={!size || (size === "lain" && !customDose.trim())}
+        className="w-full mt-6 rounded-2xl py-4 text-sm font-semibold"
+        style={{
+          backgroundColor: size && !(size === "lain" && !customDose.trim()) ? "#C69163" : "#DDD6CE",
+          color: size && !(size === "lain" && !customDose.trim()) ? "#332C2A" : "#736657",
+          cursor: size && !(size === "lain" && !customDose.trim()) ? "pointer" : "not-allowed",
+        }}
+      >
+        Lanjut
+      </button>
+    </div>
+  );
+}
+
+// Rata-rata simpangan antara "saran awal" algoritma vs setting yang
+// BENERAN dipakai user pas Dial-In (dicatat di recipe.predictedSetting vs
+// recipe.setting) — cuma dihitung per kombinasi tipe prediksi + grinder,
+// dan cuma dipakai kalau udah ada minimal 3 data poin biar nggak overreact
+// ke 1-2 kejadian yang bisa aja kebetulan.
+function computeDeviationNudge(db, predictionType, grinderId) {
+  const matches = db.recipes.filter(
+    (r) =>
+      r.predictionType === predictionType &&
+      r.grinderId === grinderId &&
+      r.predictedSetting !== undefined &&
+      r.predictedSetting !== null &&
+      r.predictedSetting !== "" &&
+      r.setting !== undefined &&
+      r.setting !== null &&
+      r.setting !== ""
+  );
+  const deviations = matches
+    .map((r) => parseFloat(r.setting) - parseFloat(r.predictedSetting))
+    .filter((d) => !isNaN(d));
+  if (deviations.length < 3) return null;
+  const avg = deviations.reduce((s, d) => s + d, 0) / deviations.length;
+  return { avg, count: deviations.length };
+}
+
+// Terapin setengah dari rata-rata simpangan (konservatif, bukan full
+// koreksi) ke sebuah prediction object bertipe non-exact, dibulatkan ke
+// step grinder. Nempelin info nudge ke object-nya biar UI bisa nunjukin.
+function applyDeviationNudge(prediction, db, grinder) {
+  if (!prediction || prediction.type === "exact") return prediction;
+  const nudge = computeDeviationNudge(db, prediction.type, grinder?.id);
+  if (!nudge) return prediction;
+  const shift = nudge.avg * 0.5;
+  const nudged = roundToStep(prediction.setting + shift, grinder);
+  return {
+    ...prediction,
+    setting: Math.round(nudged * 100) / 100,
+    nudgeApplied: Math.round(shift * 100) / 100,
+    nudgeSampleCount: nudge.count,
+  };
+}
+
 function predictSetting(db, beanId, grinderId, machineId, shotType) {
   const targetGrinder = db.grinders.find((g) => g.id === grinderId);
 
@@ -294,12 +429,16 @@ function predictSetting(db, beanId, grinderId, machineId, shotType) {
       const step = parseFloat(targetGrinder?.stepSize);
       if (!isNaN(baseSetting) && !isNaN(step)) {
         const adjusted = roundToStep(baseSetting + offset * step, targetGrinder);
-        return {
-          type: "adjusted",
-          setting: Math.round(adjusted * 100) / 100,
-          baseSetting: base.setting,
-          offset,
-        };
+        return applyDeviationNudge(
+          {
+            type: "adjusted",
+            setting: Math.round(adjusted * 100) / 100,
+            baseSetting: base.setting,
+            offset,
+          },
+          db,
+          targetGrinder
+        );
       }
     }
   }
@@ -325,13 +464,17 @@ function predictSetting(db, beanId, grinderId, machineId, shotType) {
         const fromGrinder = db.grinders.find((g) => g.id === r.grinderId);
         const raw = sourceSetting * bridge.ratio;
         const rounded = roundToStep(raw, targetGrinder);
-        return {
-          type: "bridge",
-          setting: Math.round(rounded * 100) / 100,
-          fromGrinderName: fromGrinder?.name || "grinder lain",
-          fromSetting: r.setting,
-          sampleCount: bridge.sampleCount,
-        };
+        return applyDeviationNudge(
+          {
+            type: "bridge",
+            setting: Math.round(rounded * 100) / 100,
+            fromGrinderName: fromGrinder?.name || "grinder lain",
+            fromSetting: r.setting,
+            sampleCount: bridge.sampleCount,
+          },
+          db,
+          targetGrinder
+        );
       }
     }
   }
@@ -340,7 +483,7 @@ function predictSetting(db, beanId, grinderId, machineId, shotType) {
   // paling dekat DAN sudah punya recipe di grinder ini. Nearest-neighbor
   // sederhana, bukan rumus — makanya selalu ditandai jujur sebagai "tebakan".
   const rough = guessSettingRough(db, beanId, grinderId, targetGrinder);
-  if (rough) return rough;
+  if (rough) return applyDeviationNudge(rough, db, targetGrinder);
 
   return null;
 }
@@ -1868,6 +2011,7 @@ function grinderToRow(g) {
     burr_type: g.burrType || "",
     burr_size: g.burrSize || "",
     step_size: g.stepSize ?? "1",
+    inner_burr: g.innerBurr || "",
     restricted_to_machine_id: g.restrictedToMachineId || null,
     notes: g.notes || "",
   };
@@ -1879,6 +2023,7 @@ function rowToGrinder(r) {
     burrType: r.burr_type,
     burrSize: r.burr_size,
     stepSize: r.step_size,
+    innerBurr: r.inner_burr,
     restrictedToMachineId: r.restricted_to_machine_id || "",
     notes: r.notes,
   };
@@ -1908,6 +2053,9 @@ function recipeToRow(rec) {
     status: rec.status || "Experiment",
     is_default: !!rec.isDefault,
     notes: rec.notes || "",
+    inner_burr: rec.innerBurr || "",
+    predicted_setting: rec.predictedSetting != null ? String(rec.predictedSetting) : "",
+    prediction_type: rec.predictionType || "",
     date: rec.date || new Date().toISOString(),
   };
 }
@@ -1930,6 +2078,9 @@ function rowToRecipe(r) {
     status: r.status,
     isDefault: r.is_default,
     notes: r.notes,
+    innerBurr: r.inner_burr,
+    predictedSetting: r.predicted_setting,
+    predictionType: r.prediction_type,
     date: r.date,
   };
 }
@@ -1942,6 +2093,10 @@ function brewToRow(b) {
     machine_id: b.machineId || null,
     size: b.size || "",
     feedback: b.feedback || "",
+    dose: b.dose || "",
+    yield: b.yield || "",
+    time: b.time || "",
+    inner_burr: b.innerBurr || "",
     date: b.date || new Date().toISOString(),
   };
 }
@@ -1954,6 +2109,10 @@ function rowToBrew(r) {
     machineId: r.machine_id,
     size: r.size,
     feedback: r.feedback,
+    dose: r.dose,
+    yield: r.yield,
+    time: r.time,
+    innerBurr: r.inner_burr,
     date: r.date,
   };
 }
@@ -2324,6 +2483,19 @@ function CustomSelect({ value, onChange, options, placeholder = "Pilih…" }) {
 // ---------- Bikin Kopi module ----------
 // Ikon biji kopi flat (bukan cuma garis outline) — bentuk oval dimiringkan
 // plus garis lekuk di tengah, diisi warna solid sesuai roast color-nya.
+// Nempel di bawah badge prediksi (bridge/rough/adjusted) kalau angkanya
+// udah dikoreksi otomatis dari histori simpangan saran vs pemakaian nyata.
+function NudgeNote({ prediction }) {
+  if (!prediction?.nudgeApplied) return null;
+  const amt = prediction.nudgeApplied;
+  return (
+    <div className="text-[11px] mt-1" style={{ color: "#736657" }}>
+      🔧 Sudah dikoreksi {amt > 0 ? "+" : ""}
+      {amt} dari histori simpangan saran ({prediction.nudgeSampleCount} data)
+    </div>
+  );
+}
+
 function CoffeeBeanIcon({ size = 40, color = "#8F5A34" }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" style={{ shapeRendering: "geometricPrecision" }}>
@@ -2409,12 +2581,16 @@ function SelectCard({ title, subtitle, onClick, swatchColor }) {
 }
 
 function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
-  const [step, setStep] = useState("bean"); // bean | grinder | machine | result | feedback | confirmSave | done
+  const [step, setStep] = useState("bean"); // bean | grinder | machine | size | result | feedback | confirmSave | done
   const [beanId, setBeanId] = useState(null);
   const [grinderId, setGrinderId] = useState(null);
   const [machineId, setMachineId] = useState(null);
-  const [size, setSize] = useState(null); // single | double
+  const [size, setSize] = useState(null); // single | double | lain
+  const [customDose, setCustomDose] = useState("");
   const [feedback, setFeedback] = useState(null);
+  const [quickDose, setQuickDose] = useState("");
+  const [quickYield, setQuickYield] = useState("");
+  const [quickTime, setQuickTime] = useState("");
 
   const bean = db.beans.find((b) => b.id === beanId);
   const grinder = db.grinders.find((g) => g.id === grinderId);
@@ -2422,16 +2598,40 @@ function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
   const prediction = beanId && grinderId && machineId ? predictSetting(db, beanId, grinderId, machineId) : null;
   const availableBeans = db.beans.filter((b) => !b.outOfStock);
 
+  // Kalau prediksinya "exact" (ada recipe asli) dan dose recipe itu beda
+  // dari dose target ukuran yang dipilih, geser settingnya sesuai
+  // kalibrasi dose→step. Bridge/rough/adjusted dilewati karena nggak ada
+  // dose baseline yang jelas buat jadi patokan geser.
+  const targetDose = resolveTargetDose(size, customDose);
+  const baseDoseForAdjust = prediction?.type === "exact" ? parseFloat(prediction.recipe.dose) : null;
+  const doseAdjusted =
+    prediction?.type === "exact" && targetDose != null
+      ? doseAdjustSetting(parseFloat(prediction.recipe.setting), baseDoseForAdjust, targetDose, grinder)
+      : null;
+
+  // Kalau recipe yang lagi ditampilkan dicatat waktu inner burr grinder ini
+  // masih di posisi beda dari sekarang, settingnya kemungkinan udah nggak
+  // valid lagi — tampilkan sebagai peringatan, bukan cuma diam-diam salah.
+  const innerBurrMismatch =
+    prediction?.type === "exact" &&
+    grinder?.innerBurr &&
+    prediction.recipe.innerBurr &&
+    String(grinder.innerBurr).trim() !== String(prediction.recipe.innerBurr).trim();
+
   const reset = () => {
     setStep("bean");
     setBeanId(null);
     setGrinderId(null);
     setMachineId(null);
     setSize(null);
+    setCustomDose("");
     setFeedback(null);
+    setQuickDose("");
+    setQuickYield("");
+    setQuickTime("");
   };
 
-  const STEP_BACK = { bean: null, grinder: "bean", machine: "grinder", result: "machine", feedback: "result" };
+  const STEP_BACK = { bean: null, grinder: "bean", machine: "grinder", size: "machine", result: "size", feedback: "result" };
   const goBack = () => {
     const prev = STEP_BACK[step];
     if (prev) setStep(prev);
@@ -2447,6 +2647,10 @@ function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
       machineId,
       size,
       feedback: fb || null,
+      dose: quickDose.trim(),
+      yield: quickYield.trim(),
+      time: quickTime.trim(),
+      innerBurr: grinder?.innerBurr || "",
       date: new Date().toISOString(),
     };
     setFeedback(fb);
@@ -2486,6 +2690,7 @@ function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
         rating: null,
         status: "Verified",
         isDefault: true,
+        innerBurr: grinder?.innerBurr || "",
         notes:
           prediction.type === "bridge"
             ? `Dikonfirmasi dari prediksi bridge (via ${prediction.fromGrinderName})`
@@ -2511,6 +2716,8 @@ function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
             ? "Pilih grinder yang dipakai"
             : step === "machine"
             ? "Pilih mesin yang dipakai"
+            : step === "size"
+            ? "Ukuran seduhan"
             : step === "result"
             ? "Setting siap"
             : step === "feedback"
@@ -2585,7 +2792,7 @@ function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
                   const compat = compatibleMachines(db, g);
                   if (compat.length === 1) {
                     setMachineId(compat[0].id);
-                    setStep("result");
+                    setStep("size");
                   } else {
                     setStep("machine");
                   }
@@ -2619,12 +2826,22 @@ function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
                 subtitle={m.type}
                 onClick={() => {
                   setMachineId(m.id);
-                  setStep("result");
+                  setStep("size");
                 }}
               />
             ))}
           </div>
         ))}
+
+      {step === "size" && (
+        <SizePicker
+          size={size}
+          setSize={setSize}
+          customDose={customDose}
+          setCustomDose={setCustomDose}
+          onContinue={() => setStep("result")}
+        />
+      )}
 
       {step === "result" && (
         <div className="px-5">
@@ -2660,12 +2877,28 @@ function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
                     className="text-6xl"
                     style={{ fontFamily: "'IBM Plex Mono', monospace", fontWeight: 600, color: "#2A2118" }}
                   >
-                    {prediction.type === "exact" ? prediction.recipe.setting : prediction.setting}
+                    {doseAdjusted != null ? doseAdjusted : prediction.type === "exact" ? prediction.recipe.setting : prediction.setting}
                   </div>
                 </div>
                 <div className="text-xs mt-1" style={{ color: "#6B6058" }}>Putaran grinder</div>
 
-                {prediction.type === "exact" && prediction.recipe.status === "Experiment" && (
+                {innerBurrMismatch && (
+                  <div
+                    className="inline-flex items-center gap-1.5 mt-4 rounded-full text-xs px-3 py-1.5"
+                    style={{ backgroundColor: "#FBEADD", color: "#B5493A" }}
+                  >
+                    ⚠️ Inner burr sekarang ({grinder.innerBurr}) beda dari saat data ini dicatat ({prediction.recipe.innerBurr})
+                  </div>
+                )}
+                {doseAdjusted != null && (
+                  <div
+                    className="inline-flex items-center gap-1.5 mt-4 rounded-full text-xs px-3 py-1.5"
+                    style={{ backgroundColor: "#F5E6D8", color: "#B8763C" }}
+                  >
+                    ⚖️ Disesuaikan dari data dose {prediction.recipe.dose}g ke ~{targetDose}g
+                  </div>
+                )}
+                {doseAdjusted == null && prediction.type === "exact" && prediction.recipe.status === "Experiment" && (
                   <div
                     className="inline-flex items-center gap-1.5 mt-4 rounded-full text-xs px-3 py-1.5"
                     style={{ backgroundColor: "#FBF3DD", color: "#A6801F" }}
@@ -2673,7 +2906,7 @@ function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
                     🟡 Eksperimen — belum tentu pas
                   </div>
                 )}
-                {prediction.type === "exact" && prediction.recipe.status !== "Experiment" && (
+                {doseAdjusted == null && prediction.type === "exact" && prediction.recipe.status !== "Experiment" && (
                   <div
                     className="inline-flex items-center gap-1.5 mt-4 rounded-full text-xs px-3 py-1.5"
                     style={{ backgroundColor: "#E3F5EC", color: "#1F7A4C" }}
@@ -2692,6 +2925,7 @@ function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
                     <div className="text-[11px] mt-2" style={{ color: "#736657" }}>
                       Dihitung dari {grinder?.name} vs {prediction.fromGrinderName} ({bean?.name} pernah di setting {prediction.fromSetting} di {prediction.fromGrinderName}) · {prediction.sampleCount} data bridge
                     </div>
+                    <NudgeNote prediction={prediction} />
                   </>
                 )}
                 {prediction.type === "rough" && (
@@ -2705,42 +2939,17 @@ function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
                     <div className="text-[11px] mt-2" style={{ color: "#736657" }}>
                       Berdasarkan density terdekat: {prediction.basedOnBeanName} (d={Math.round(prediction.basedOnDensity * 100)}{prediction.sameRoast ? ", roast sama" : ""}) · bukan hasil seduhan langsung
                     </div>
+                    <NudgeNote prediction={prediction} />
                   </>
                 )}
               </div>
 
               <LastTrialCard db={db} beanId={beanId} grinderId={grinderId} machineId={machineId} />
 
-              <div className="mt-6">
-                <div className="text-xs mb-2.5" style={{ color: "#6B6058" }}>Ukuran</div>
-                <div className="grid grid-cols-2 gap-3">
-                  {["single", "double"].map((s) => (
-                    <button
-                      key={s}
-                      onClick={() => setSize(s)}
-                      className="rounded-xl py-3 text-sm capitalize"
-                      style={{
-                        backgroundColor: size === s ? "#C69163" : "transparent",
-                        color: size === s ? "#332C2A" : "#6B6058",
-                        border: `1px solid ${size === s ? "#C69163" : "#DDD6CE"}`,
-                        fontWeight: size === s ? 600 : 400,
-                      }}
-                    >
-                      {s === "single" ? "Single" : "Double"}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
               <button
-                onClick={() => size && setStep("feedback")}
-                disabled={!size}
+                onClick={() => setStep("feedback")}
                 className="w-full mt-6 rounded-2xl py-4 text-sm font-semibold"
-                style={{
-                  backgroundColor: size ? "#C69163" : "#DDD6CE",
-                  color: size ? "#332C2A" : "#736657",
-                  cursor: size ? "pointer" : "not-allowed",
-                }}
+                style={{ backgroundColor: "#C69163", color: "#332C2A" }}
               >
                 Seduh
               </button>
@@ -2774,6 +2983,38 @@ function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
                 {tag}
               </button>
             ))}
+          </div>
+
+          <div className="mt-5 rounded-2xl px-4 py-3.5" style={{ backgroundColor: "#F7F3EE", border: "1px dashed #DDD6CE" }}>
+            <div className="text-xs mb-2.5" style={{ color: "#6B6058" }}>
+              Kalau sempat nimbang/hitung waktu (opsional, boleh dikosongin)
+            </div>
+            <div className="grid grid-cols-3 gap-2">
+              <Field label="Dose (g)">
+                <input
+                  className={inputCls} style={inputStyle}
+                  placeholder="—"
+                  value={quickDose}
+                  onChange={(e) => setQuickDose(e.target.value)}
+                />
+              </Field>
+              <Field label="Yield (g)">
+                <input
+                  className={inputCls} style={inputStyle}
+                  placeholder="—"
+                  value={quickYield}
+                  onChange={(e) => setQuickYield(e.target.value)}
+                />
+              </Field>
+              <Field label="Waktu (s)">
+                <input
+                  className={inputCls} style={inputStyle}
+                  placeholder="—"
+                  value={quickTime}
+                  onChange={(e) => setQuickTime(e.target.value)}
+                />
+              </Field>
+            </div>
           </div>
 
           <button
@@ -2874,11 +3115,56 @@ const SHOT_TYPES = [
   { key: "Lainnya", hint: "" },
 ];
 
+// Rentang waktu (detik) buat masing-masing jenis shot — sama kayak yang
+// dipakai di hint SHOT_TYPES di atas, tapi dalam bentuk angka biar bisa
+// dipakai buat klasifikasi otomatis + saran arah geser grind.
+const SHOT_TIME_RANGE = {
+  "Turbo Shot": [15, 20],
+  Ristretto: [20, 25],
+  Espresso: [25, 30],
+  Lungo: [30, 40],
+};
+
+// Klasifikasi hasil shot berdasarkan waktu ekstraksi aktual (paling
+// reliable dibanding rasio doang) — dipakai buat kasih tau user "ini
+// hasilnya kecemplung ke kategori apa", terlepas dari yang dia pilih di awal.
+function classifyShotResult(dose, yieldVal, time) {
+  const d = parseFloat(dose);
+  const y = parseFloat(yieldVal);
+  const t = parseFloat(time);
+  if (isNaN(t)) return null;
+  const ratio = !isNaN(d) && !isNaN(y) && d > 0 ? y / d : null;
+  let category = "Lainnya";
+  if (t < 15) category = "Lainnya";
+  else if (t <= 20) category = "Turbo Shot";
+  else if (t <= 25) category = "Ristretto";
+  else if (t <= 30) category = "Espresso";
+  else if (t <= 40) category = "Lungo";
+  return { category, ratio, time: t };
+}
+
+// Saran arah geser grind buat shot BERIKUTNYA kalau mau ngejar shotType
+// yang tadinya diniatkan (bukan yang kepencet). Ini estimasi konservatif
+// (1 step grinder ke arah yang benar), BUKAN hasil kalkulasi presisi —
+// nggak ada data kalibrasi detik-per-step, jadi cuma dikasih arah + 1 step
+// kecil sebagai titik awal coba-coba berikutnya.
+function suggestNextGrindShift(actualTime, targetShotType, grinder) {
+  const range = SHOT_TIME_RANGE[targetShotType];
+  const t = parseFloat(actualTime);
+  if (!range || isNaN(t)) return null;
+  const step = parseFloat(grinder?.stepSize) || 1;
+  if (t < range[0]) return { direction: "finer", stepDelta: step };
+  if (t > range[1]) return { direction: "coarser", stepDelta: step };
+  return null;
+}
+
 function DialInScreen({ db, persist, onBack, onGoDatabase }) {
-  const [step, setStep] = useState("bean"); // bean|grinder|machine|shotType|prediction|shot|evaluasi|confirmDefault|done
+  const [step, setStep] = useState("bean"); // bean|grinder|machine|size|shotType|prediction|shot|evaluasi|confirmDefault|done
   const [beanId, setBeanId] = useState(null);
   const [grinderId, setGrinderId] = useState(null);
   const [machineId, setMachineId] = useState(null);
+  const [size, setSize] = useState(null); // single | double | lain
+  const [customDose, setCustomDose] = useState("");
   const [shotType, setShotType] = useState(null);
   const [shot, setShot] = useState({
     setting: "",
@@ -2899,11 +3185,27 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
   const prediction = beanId && grinderId && machineId && shotType ? predictSetting(db, beanId, grinderId, machineId, shotType) : null;
   const availableBeans = db.beans.filter((b) => !b.outOfStock);
 
+  // Sama kayak Bikin Kopi: kalau ada recipe asli (exact) dengan dose beda
+  // dari target ukuran yang dipilih, geser settingnya sebagai titik awal.
+  const targetDose = resolveTargetDose(size, customDose);
+  const baseDoseForAdjust = prediction?.type === "exact" ? parseFloat(prediction.recipe.dose) : null;
+  const doseAdjusted =
+    prediction?.type === "exact" && targetDose != null
+      ? doseAdjustSetting(parseFloat(prediction.recipe.setting), baseDoseForAdjust, targetDose, grinder)
+      : null;
+  const innerBurrMismatch =
+    prediction?.type === "exact" &&
+    grinder?.innerBurr &&
+    prediction.recipe.innerBurr &&
+    String(grinder.innerBurr).trim() !== String(prediction.recipe.innerBurr).trim();
+
   const reset = () => {
     setStep("bean");
     setBeanId(null);
     setGrinderId(null);
     setMachineId(null);
+    setSize(null);
+    setCustomDose("");
     setShotType(null);
     setShot({ setting: "", dose: "", yield: "", time: "", wdt: "Ya", puck: "Kertas", basket: "Standard" });
     setTaste(null);
@@ -2918,7 +3220,8 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
     bean: null,
     grinder: "bean",
     machine: "grinder",
-    shotType: "machine",
+    size: "machine",
+    shotType: "size",
     prediction: "shotType",
     shot: "prediction",
     evaluasi: "shot",
@@ -2949,6 +3252,9 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
       rating,
       status: "Experiment",
       isDefault: false,
+      innerBurr: grinder?.innerBurr || "",
+      predictedSetting: prediction && prediction.type !== "exact" ? prediction.setting : "",
+      predictionType: prediction && prediction.type !== "exact" ? prediction.type : "",
       notes: taste2Notes.trim(),
       date: new Date().toISOString(),
     };
@@ -2982,6 +3288,8 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
             ? "Pilih grinder yang dipakai"
             : step === "machine"
             ? "Pilih mesin yang dipakai"
+            : step === "size"
+            ? "Ukuran seduhan"
             : step === "shotType"
             ? "Mau bikin jenis shot apa?"
             : step === "prediction"
@@ -3057,7 +3365,7 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
                   const compat = compatibleMachines(db, g);
                   if (compat.length === 1) {
                     setMachineId(compat[0].id);
-                    setStep("shotType");
+                    setStep("size");
                   } else {
                     setStep("machine");
                   }
@@ -3082,10 +3390,20 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
         ) : (
           <div className="px-5 space-y-2.5">
             {compatibleMachines(db, grinder).map((m) => (
-              <SelectCard key={m.id} title={m.name} subtitle={m.type} onClick={() => { setMachineId(m.id); setStep("shotType"); }} />
+              <SelectCard key={m.id} title={m.name} subtitle={m.type} onClick={() => { setMachineId(m.id); setStep("size"); }} />
             ))}
           </div>
         ))}
+
+      {step === "size" && (
+        <SizePicker
+          size={size}
+          setSize={setSize}
+          customDose={customDose}
+          setCustomDose={setCustomDose}
+          onContinue={() => setStep("shotType")}
+        />
+      )}
 
       {step === "shotType" && (
         <div className="px-5 space-y-2.5">
@@ -3134,10 +3452,25 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
                     <CoffeeBeanIcon size={40} color={roastColorFromValue(bean.roastColor)} />
                   )}
                   <div className="text-6xl" style={{ fontFamily: "'IBM Plex Mono', monospace", fontWeight: 600, color: "#2A2118" }}>
-                    {prediction.recipe.setting}
+                    {doseAdjusted != null ? doseAdjusted : prediction.recipe.setting}
                   </div>
                 </div>
-                <div className="text-xs mt-1" style={{ color: "#6B6058" }}>Setting terbaik yang tercatat</div>
+                <div className="text-xs mt-1" style={{ color: "#6B6058" }}>
+                  {doseAdjusted != null ? "Disesuaikan dari data dose beda" : "Setting terbaik yang tercatat"}
+                </div>
+                {innerBurrMismatch && (
+                  <div
+                    className="inline-flex items-center gap-1.5 mt-2 rounded-full text-xs px-3 py-1.5"
+                    style={{ backgroundColor: "#FBEADD", color: "#B5493A" }}
+                  >
+                    ⚠️ Inner burr sekarang ({grinder.innerBurr}) beda dari saat data ini dicatat ({prediction.recipe.innerBurr})
+                  </div>
+                )}
+                {doseAdjusted != null && (
+                  <div className="text-[11px] mt-2" style={{ color: "#736657" }}>
+                    Dari recipe dose {prediction.recipe.dose}g → target ~{targetDose}g
+                  </div>
+                )}
                 <div
                   className="inline-flex items-center gap-1.5 mt-4 rounded-full text-xs px-3 py-1.5"
                   style={{ backgroundColor: "#E3F5EC", color: "#1F7A4C" }}
@@ -3162,6 +3495,7 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
                 >
                   🎯 {prediction.offset > 0 ? `+${prediction.offset}` : prediction.offset} step dari Espresso ({prediction.baseSetting})
                 </div>
+                <NudgeNote prediction={prediction} />
               </>
             ) : prediction?.type === "bridge" ? (
               <>
@@ -3183,6 +3517,7 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
                 <div className="text-[11px] mt-2" style={{ color: "#736657" }}>
                   Dihitung dari {bean?.name} di {prediction.fromGrinderName} (setting {prediction.fromSetting}) · {prediction.sampleCount} data bridge
                 </div>
+                <NudgeNote prediction={prediction} />
               </>
             ) : prediction?.type === "rough" ? (
               <>
@@ -3204,6 +3539,7 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
                 <div className="text-[11px] mt-2" style={{ color: "#736657" }}>
                   Berdasarkan density terdekat: {prediction.basedOnBeanName} (d={Math.round(prediction.basedOnDensity * 100)}{prediction.sameRoast ? ", roast sama" : ""})
                 </div>
+                <NudgeNote prediction={prediction} />
               </>
             ) : (
               <>
@@ -3224,8 +3560,9 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
 
           <button
             onClick={() => {
-              if (prediction?.type === "exact") setShotField("setting", prediction.recipe.setting);
+              if (prediction?.type === "exact") setShotField("setting", doseAdjusted != null ? String(doseAdjusted) : prediction.recipe.setting);
               else if (prediction?.type === "bridge" || prediction?.type === "rough" || prediction?.type === "adjusted") setShotField("setting", String(prediction.setting));
+              if (targetDose != null) setShotField("dose", String(targetDose));
               setStep("shot");
             }}
             className="w-full mt-6 rounded-2xl py-4 text-sm font-semibold"
@@ -3252,6 +3589,32 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
           <Field label="Waktu (detik)">
             <input className={inputCls} style={inputStyle} placeholder="27" value={shot.time} onChange={(e) => setShotField("time", e.target.value)} />
           </Field>
+
+          {(() => {
+            const result = classifyShotResult(shot.dose, shot.yield, shot.time);
+            if (!result) return null;
+            const mismatch = shotType && shotType !== "Lainnya" && result.category !== shotType;
+            const suggestion = mismatch ? suggestNextGrindShift(result.time, shotType, grinder) : null;
+            return (
+              <div
+                className="rounded-2xl px-4 py-3.5"
+                style={{ backgroundColor: mismatch ? "#FBEADD" : "#E3F5EC", border: `1px solid ${mismatch ? "#B8632E" : "#1F7A4C"}` }}
+              >
+                <div className="text-xs" style={{ color: mismatch ? "#B8632E" : "#1F7A4C" }}>
+                  {result.ratio != null
+                    ? `Rasio ~1:${Math.round(result.ratio * 100) / 100}, ${result.time}s — masuk kategori ${result.category}`
+                    : `${result.time}s — masuk kategori ${result.category}`}
+                  {mismatch && ` (kamu pilih ${shotType})`}
+                </div>
+                {suggestion && (
+                  <div className="text-xs mt-1.5" style={{ color: "#6B6058" }}>
+                    💡 Buat next kali ngejar {shotType}, coba geser {suggestion.direction === "finer" ? "lebih halus" : "lebih kasar"} ~{suggestion.stepDelta} step di {grinder?.name || "grinder ini"} — estimasi awal, bukan angka pasti.
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+
           <Field label="Puck screen">
             <ToggleGroup
               value={shot.puck}
@@ -3377,6 +3740,20 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
           <p className="text-sm mb-6" style={{ color: "#6B6058" }}>
             Setting {savedRecipe?.setting} akan jadi rekomendasi utama untuk {bean?.name} + {grinder?.name} di Bikin Kopi.
           </p>
+          {savedRecipe?.predictedSetting !== undefined && savedRecipe?.predictedSetting !== "" && (
+            <div
+              className="rounded-2xl px-4 py-3 mb-6 text-xs"
+              style={{ backgroundColor: "#F7F3EE", border: "1px solid #DDD6CE", color: "#6B6058" }}
+            >
+              Prediksi awal: {savedRecipe.predictedSetting} → Kamu pakai: {savedRecipe.setting} (selisih{" "}
+              {(() => {
+                const diff = parseFloat(savedRecipe.setting) - parseFloat(savedRecipe.predictedSetting);
+                if (isNaN(diff)) return "?";
+                return `${diff > 0 ? "+" : ""}${Math.round(diff * 100) / 100}`;
+              })()}
+              )
+            </div>
+          )}
           <div className="flex gap-3">
             <button
               onClick={() => markDefault(false)}
@@ -3499,6 +3876,7 @@ const FORM_SCHEMAS = {
     { key: "burrType", label: "Tipe burr", placeholder: "cth. Flat" },
     { key: "burrSize", label: "Ukuran burr (mm)", placeholder: "cth. 64" },
     { key: "stepSize", label: "Step size", placeholder: "cth. 0.25" },
+    { key: "innerBurr", label: "Setting Inner Burr saat ini (kalau ada, mis. grinder Breville)", placeholder: "cth. 4" },
     { key: "restrictedToMachineId", label: "Khusus mesin (kosongkan kalau bisa semua)", ref: "machines" },
     { key: "notes", label: "Catatan", textarea: true },
   ],
@@ -3564,6 +3942,7 @@ function ItemForm({ tabKey, db, initial, onCancel, onSave }) {
   });
 
   const set = (k, v) => setValues((prev) => ({ ...prev, [k]: v }));
+  const [showDensityGuide, setShowDensityGuide] = useState(false);
 
   const canSave = schema
     .filter((f) => f.required)
@@ -3667,6 +4046,34 @@ function ItemForm({ tabKey, db, initial, onCancel, onSave }) {
                         ⚠️ Kelihatannya kurang wajar (density kopi biasanya 20–70 gram per 100ml) — cek lagi timbangannya.
                       </p>
                     )}
+                  {f.densityField && (
+                    <button
+                      type="button"
+                      onClick={() => setShowDensityGuide((v) => !v)}
+                      className="text-[11px] mt-1.5"
+                      style={{ color: "#B8763C" }}
+                    >
+                      {showDensityGuide ? "Sembunyikan cara ukur" : "Bingung cara isinya? Klik ini aja"}
+                    </button>
+                  )}
+                  {f.densityField && showDensityGuide && (
+                    <div
+                      className="mt-2 rounded-xl p-3 text-[11px] leading-relaxed"
+                      style={{ backgroundColor: "#F7F3EE", border: "1px solid #DDD6CE", color: "#2A2118" }}
+                    >
+                      <div className="font-semibold mb-1">Cara ukur density biji kopi:</div>
+                      <div>Alat: timbangan dapur + wadah/gelas ukur 100ml.</div>
+                      <ol className="mt-1 ml-4" style={{ listStyleType: "decimal" }}>
+                        <li>Taruh wadah 100ml kosong di atas timbangan</li>
+                        <li>Tekan Tare/Zero biar mulai dari angka 0</li>
+                        <li>Tuang biji kopi utuh (belum digiling) sampai pas rata 100ml</li>
+                        <li>Ketuk-ketuk pelan wadahnya biar nggak ada rongga kosong</li>
+                        <li>Catat angka gram yang muncul di timbangan</li>
+                        <li>Masukin angka itu langsung ke kolom ini, nggak perlu dihitung ulang</li>
+                      </ol>
+                      <div className="mt-1.5">Contoh: biji sampai 100ml beratnya 44 gram → isi kolom ini dengan 44.</div>
+                    </div>
+                  )}
                 </>
               )}
             </Field>
@@ -4033,6 +4440,9 @@ function BrewHistoryPanel({ db, persist }) {
                   {[
                     b.size === "single" ? "Single" : b.size === "double" ? "Double" : null,
                     recipe?.setting && `setting ${recipe.setting}`,
+                    b.dose && `${b.dose}g`,
+                    b.yield && `→${b.yield}g`,
+                    b.time && `${b.time}s`,
                     b.feedback,
                   ]
                     .filter(Boolean)
@@ -4488,7 +4898,7 @@ function DatabaseScreen({ db, persist, onBack, initialTab }) {
                       ]
                         .filter(Boolean)
                         .join(" · ")}
-                    {tab === "grinders" && [item.burrType, item.burrSize && `${item.burrSize}mm`, item.stepSize && `step ${item.stepSize}`].filter(Boolean).join(" · ")}
+                    {tab === "grinders" && [item.burrType, item.burrSize && `${item.burrSize}mm`, item.stepSize && `step ${item.stepSize}`, item.innerBurr && `inner burr ${item.innerBurr}`].filter(Boolean).join(" · ")}
                     {tab === "machines" && item.type}
                     {tab === "recipes" && [item.shotType && item.shotType !== "Espresso" && item.shotType, item.dose && `${item.dose}g`, item.yield && `→${item.yield}g`, item.time && `${item.time}s`, item.basket === "Bottomless" && "Bottomless", item.taste, item.status].filter(Boolean).join(" · ")}
                   </div>
