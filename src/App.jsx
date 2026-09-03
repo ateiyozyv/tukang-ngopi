@@ -2496,6 +2496,29 @@ function NudgeNote({ prediction }) {
   );
 }
 
+// Badge kecil "kategori shot berdasarkan hasil aktual" — dihitung on-the-fly
+// dari dose/yield/time recipe (bukan disimpan terpisah), dipakai di mana
+// pun recipe ditampilkan. Kalau beda dari shotType yang dipilih user pas
+// dial-in, ditandain biar ketauan ada mismatch.
+function ShotCategoryBadge({ dose, yieldVal, time, intendedShotType }) {
+  const result = classifyShotResult(dose, yieldVal, time);
+  if (!result) return null;
+  const intended = intendedShotType || "Espresso";
+  const mismatch = intended !== "Lainnya" && result.category !== intended;
+  return (
+    <span
+      className="text-[11px] rounded-full px-2 py-0.5"
+      style={{
+        backgroundColor: mismatch ? "#FBEADD" : "#E3F5EC",
+        color: mismatch ? "#B8632E" : "#1F7A4C",
+      }}
+    >
+      Hasil: {result.category}
+      {mismatch && ` (dipilih: ${intended})`}
+    </span>
+  );
+}
+
 function CoffeeBeanIcon({ size = 40, color = "#8F5A34" }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" style={{ shapeRendering: "geometricPrecision" }}>
@@ -2543,6 +2566,9 @@ function LastTrialCard({ db, beanId, grinderId, machineId }) {
         📋 Percobaan Terakhir · setting {r.setting}
       </div>
       {details && <div className="text-sm" style={{ color: "#2A2118" }}>{details}</div>}
+      <div className="mt-1">
+        <ShotCategoryBadge dose={r.dose} yieldVal={r.yield} time={r.time} intendedShotType={r.shotType} />
+      </div>
       {tasteLine && <div className="text-sm mt-0.5" style={{ color: "#2A2118" }}>{tasteLine}</div>}
       {fmtDate(r.date) && <div className="text-xs mt-1" style={{ color: "#736657" }}>{fmtDate(r.date)}</div>}
       {r.notes && (
@@ -4078,6 +4104,15 @@ function ItemForm({ tabKey, db, initial, onCancel, onSave }) {
               )}
             </Field>
           ))}
+
+          {tabKey === "recipes" && (
+            <ShotCategoryBadge
+              dose={values.dose}
+              yieldVal={values.yield}
+              time={values.time}
+              intendedShotType={values.shotType}
+            />
+          )}
         </div>
 
         <div className="flex gap-3 mt-6">
@@ -4275,6 +4310,9 @@ function ShotHistoryPanel({ db, persist, onEdit }) {
                   {[r.shotType && r.shotType !== "Espresso" && r.shotType, r.dose && `${r.dose}g`, r.yield && `→${r.yield}g`, r.time && `${r.time}s`, r.basket === "Bottomless" && "Bottomless", r.taste, r.rating && `${r.rating}/10`]
                     .filter(Boolean)
                     .join(" · ")}
+                </div>
+                <div className="mt-1">
+                  <ShotCategoryBadge dose={r.dose} yieldVal={r.yield} time={r.time} intendedShotType={r.shotType} />
                 </div>
                 {r.notes && (
                   <div
