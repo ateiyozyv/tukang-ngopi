@@ -2504,17 +2504,18 @@ function ShotCategoryBadge({ dose, yieldVal, time, intendedShotType }) {
   const result = classifyShotResult(dose, yieldVal, time);
   if (!result) return null;
   const intended = intendedShotType || "Espresso";
-  const mismatch = intended !== "Lainnya" && result.category !== intended;
+  const mismatch = !result.conflict && intended !== "Lainnya" && result.category !== intended;
   return (
     <span
       className="text-[11px] rounded-full px-2 py-0.5"
       style={{
-        backgroundColor: mismatch ? "#FBEADD" : "#E3F5EC",
-        color: mismatch ? "#B8632E" : "#1F7A4C",
+        backgroundColor: mismatch || result.conflict ? "#FBEADD" : "#E3F5EC",
+        color: mismatch || result.conflict ? "#B8632E" : "#1F7A4C",
       }}
     >
-      Hasil: {result.category}
-      {mismatch && ` (dipilih: ${intended})`}
+      {result.conflict
+        ? `⚠️ Waktu mirip ${result.timeCategory}, tapi rasio (~1:${Math.round(result.ratio * 100) / 100}) mirip ${result.ratioCategory || "kategori lain"} — kemungkinan aliran nggak wajar`
+        : `Hasil: ${result.category}${mismatch ? ` (dipilih: ${intended})` : ""}`}
     </span>
   );
 }
@@ -3151,22 +3152,64 @@ const SHOT_TIME_RANGE = {
   Lungo: [30, 40],
 };
 
-// Klasifikasi hasil shot berdasarkan waktu ekstraksi aktual (paling
-// reliable dibanding rasio doang) — dipakai buat kasih tau user "ini
-// hasilnya kecemplung ke kategori apa", terlepas dari yang dia pilih di awal.
+// Rentang rasio (yield/dose) wajar per kategori — dipakai buat CROSS-CHECK
+// hasil klasifikasi waktu. Sengaja dibikin longgar (bukan presisi mirror
+// hint SHOT_TYPES) karena tujuannya cuma nangkep kasus "waktu masuk
+// kategori X, tapi rasio jauh banget dari wajarnya X" (biasanya tanda
+// channeling/aliran nggak wajar), bukan buat jadi sumber kebenaran sendiri.
+const SHOT_RATIO_RANGE = {
+  "Turbo Shot": [2, 3.5],
+  Ristretto: [0.8, 1.7],
+  Espresso: [1.5, 2.5],
+  Lungo: [2.5, 4.5],
+};
+
+// Klasifikasi hasil shot dari waktu ekstraksi DAN rasio bareng-bareng.
+// Waktu jadi kandidat utama (paling reliable buat mbedain shot pendek vs
+// panjang), tapi kalau rasio ternyata jauh dari wajarnya kategori itu
+// (misal waktu bilang Espresso tapi rasio udah 1:3 kayak Lungo), jangan
+// dipaksa masuk kategori itu — tandain sebagai "Lainnya" + alasan konflik,
+// biar jujur ada yang aneh (kemungkinan channeling/aliran kecepetan),
+// bukan asal comot kategori dari satu sisi doang.
 function classifyShotResult(dose, yieldVal, time) {
   const d = parseFloat(dose);
   const y = parseFloat(yieldVal);
   const t = parseFloat(time);
   if (isNaN(t)) return null;
   const ratio = !isNaN(d) && !isNaN(y) && d > 0 ? y / d : null;
-  let category = "Lainnya";
-  if (t < 15) category = "Lainnya";
-  else if (t <= 20) category = "Turbo Shot";
-  else if (t <= 25) category = "Ristretto";
-  else if (t <= 30) category = "Espresso";
-  else if (t <= 40) category = "Lungo";
-  return { category, ratio, time: t };
+
+  let timeCategory = "Lainnya";
+  if (t >= 15 && t <= 20) timeCategory = "Turbo Shot";
+  else if (t <= 25) timeCategory = "Ristretto";
+  else if (t <= 30) timeCategory = "Espresso";
+  else if (t <= 40) timeCategory = "Lungo";
+
+  if (timeCategory === "Lainnya" || ratio == null) {
+    return { category: timeCategory, ratio, time: t, conflict: false };
+  }
+
+  const range = SHOT_RATIO_RANGE[timeCategory];
+  const ratioMatches = ratio >= range[0] && ratio <= range[1];
+  if (ratioMatches) {
+    return { category: timeCategory, ratio, time: t, conflict: false };
+  }
+
+  // Waktu & rasio nggak sinkron — cari kategori mana yang rasionya cocok,
+  // buat dijelasin di catatan konflik.
+  const ratioCategory =
+    Object.keys(SHOT_RATIO_RANGE).find((k) => {
+      const rr = SHOT_RATIO_RANGE[k];
+      return ratio >= rr[0] && ratio <= rr[1];
+    }) || null;
+
+  return {
+    category: "Lainnya",
+    ratio,
+    time: t,
+    conflict: true,
+    timeCategory,
+    ratioCategory,
+  };
 }
 
 // Saran arah geser grind buat shot BERIKUTNYA kalau mau ngejar shotType
@@ -3619,15 +3662,18 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
           {(() => {
             const result = classifyShotResult(shot.dose, shot.yield, shot.time);
             if (!result) return null;
-            const mismatch = shotType && shotType !== "Lainnya" && result.category !== shotType;
+            const mismatch = !result.conflict && shotType && shotType !== "Lainnya" && result.category !== shotType;
+            const flagged = mismatch || result.conflict;
             const suggestion = mismatch ? suggestNextGrindShift(result.time, shotType, grinder) : null;
             return (
               <div
                 className="rounded-2xl px-4 py-3.5"
-                style={{ backgroundColor: mismatch ? "#FBEADD" : "#E3F5EC", border: `1px solid ${mismatch ? "#B8632E" : "#1F7A4C"}` }}
+                style={{ backgroundColor: flagged ? "#FBEADD" : "#E3F5EC", border: `1px solid ${flagged ? "#B8632E" : "#1F7A4C"}` }}
               >
-                <div className="text-xs" style={{ color: mismatch ? "#B8632E" : "#1F7A4C" }}>
-                  {result.ratio != null
+                <div className="text-xs" style={{ color: flagged ? "#B8632E" : "#1F7A4C" }}>
+                  {result.conflict
+                    ? `⚠️ Waktu mirip ${result.timeCategory}, tapi rasio (~1:${Math.round(result.ratio * 100) / 100}) mirip ${result.ratioCategory || "kategori lain"} — kemungkinan aliran nggak wajar (channeling?)`
+                    : result.ratio != null
                     ? `Rasio ~1:${Math.round(result.ratio * 100) / 100}, ${result.time}s — masuk kategori ${result.category}`
                     : `${result.time}s — masuk kategori ${result.category}`}
                   {mismatch && ` (kamu pilih ${shotType})`}
