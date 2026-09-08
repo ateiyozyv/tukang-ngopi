@@ -2581,6 +2581,67 @@ function LastTrialCard({ db, beanId, grinderId, machineId }) {
   );
 }
 
+// Collapsible: semua trial Dial-In (bukan cuma yang terakhir) buat
+// kombinasi bean+grinder+mesin ini, urut dari yang paling baru.
+function FullTrialHistory({ db, beanId, grinderId, machineId }) {
+  const [open, setOpen] = useState(false);
+  const entries = db.recipes
+    .filter((r) => r.beanId === beanId && r.grinderId === grinderId && r.machineId === machineId)
+    .slice()
+    .sort((a, b) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime());
+
+  const fmtDate = (iso) => {
+    if (!iso) return "Tanggal tidak diketahui";
+    return new Date(iso).toLocaleDateString("id-ID", { day: "numeric", month: "short", year: "numeric" });
+  };
+
+  if (entries.length === 0) return null;
+
+  return (
+    <div className="mt-3">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="text-xs"
+        style={{ color: "#B8763C" }}
+      >
+        {open ? "Sembunyikan histori" : `Lihat histori lengkap (${entries.length})`}
+      </button>
+      {open && (
+        <div className="mt-2 space-y-2">
+          {entries.map((r) => {
+            const details = [r.dose && `${r.dose}g`, r.yield && `→${r.yield}g`, r.time && `${r.time}s`, r.basket === "Bottomless" && "Bottomless"]
+              .filter(Boolean)
+              .join(" · ");
+            const tasteLine = [r.taste, r.rating && `${r.rating}/10`].filter(Boolean).join(" · ");
+            return (
+              <div
+                key={r.id}
+                className="rounded-xl px-3.5 py-3"
+                style={{ backgroundColor: "#F7F3EE", border: "1px solid #DDD6CE" }}
+              >
+                <div className="text-xs font-semibold" style={{ color: "#2A2118" }}>
+                  Setting {r.setting} {r.shotType && r.shotType !== "Espresso" ? `· ${r.shotType}` : ""}
+                </div>
+                {details && <div className="text-xs mt-0.5" style={{ color: "#6B6058" }}>{details}</div>}
+                <div className="mt-1">
+                  <ShotCategoryBadge dose={r.dose} yieldVal={r.yield} time={r.time} intendedShotType={r.shotType} />
+                </div>
+                {tasteLine && <div className="text-xs mt-1" style={{ color: "#2A2118" }}>{tasteLine}</div>}
+                {r.notes && (
+                  <div className="text-xs mt-1 italic" style={{ color: "#736657" }}>
+                    "{r.notes}"
+                  </div>
+                )}
+                <div className="text-[11px] mt-1" style={{ color: "#736657" }}>{fmtDate(r.date)}</div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SelectCard({ title, subtitle, onClick, swatchColor }) {
   return (
     <button
@@ -3626,6 +3687,7 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
           </div>
 
           {prediction && <LastTrialCard db={db} beanId={beanId} grinderId={grinderId} machineId={machineId} />}
+          <FullTrialHistory db={db} beanId={beanId} grinderId={grinderId} machineId={machineId} />
 
           <button
             onClick={() => {
