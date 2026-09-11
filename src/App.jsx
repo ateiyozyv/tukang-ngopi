@@ -288,6 +288,22 @@ function roundToStep(value, grinder) {
 // Keduanya = 0,25 "step grinder" per 4 gram dose → 0,0625 step per gram.
 const DOSE_STEP_PER_GRAM = 0.0625; // dalam satuan step grinder, per gram dose
 
+// Batas bawah paling halus yang masih aman buat sebuah grinder — dari
+// field "Setting minimum aman" (kalau diisi user berdasar pengalaman,
+// misal K64S gampang macet di bawah 0,5), atau fallback ke 1 step di atas
+// nol kalau belum diisi. Dipakai buat nyegah prediksi (bukan data recipe
+// asli) nyaranin angka yang nggak masuk akal/berpotensi bikin grinder macet.
+function safeMinSetting(grinder) {
+  const step = parseFloat(grinder?.stepSize) || 1;
+  const configured = parseFloat(grinder?.minSafeSetting);
+  return !isNaN(configured) ? configured : step;
+}
+
+function clampToSafeMin(value, grinder) {
+  const min = safeMinSetting(grinder);
+  return value < min ? min : value;
+}
+
 // Geser setting berdasarkan selisih dose dari dose asal recipe (baseDose)
 // ke target dose yang diminta. Return null kalau salah satu dose nggak
 // valid/nggak beda, biar caller tau nggak perlu nampilin penyesuaian.
@@ -298,7 +314,8 @@ function doseAdjustSetting(baseSetting, baseDose, targetDose, grinder) {
   const gramDiff = targetDose - baseDose;
   const numericShift = gramDiff * DOSE_STEP_PER_GRAM * step;
   const raw = baseSetting + numericShift;
-  return Math.round(roundToStep(raw, grinder) * 100) / 100;
+  const rounded = roundToStep(raw, grinder);
+  return Math.round(clampToSafeMin(rounded, grinder) * 100) / 100;
 }
 
 // Dose nominal per pilihan ukuran di layar Bikin Kopi — dipakai buat
@@ -398,15 +415,19 @@ function computeDeviationNudge(db, predictionType, grinderId) {
 // Terapin setengah dari rata-rata simpangan (konservatif, bukan full
 // koreksi) ke sebuah prediction object bertipe non-exact, dibulatkan ke
 // step grinder. Nempelin info nudge ke object-nya biar UI bisa nunjukin.
+// Apa pun kejadiannya (di-nudge atau enggak), settingnya selalu dikunci
+// nggak boleh di bawah batas minimum aman grinder itu.
 function applyDeviationNudge(prediction, db, grinder) {
   if (!prediction || prediction.type === "exact") return prediction;
   const nudge = computeDeviationNudge(db, prediction.type, grinder?.id);
-  if (!nudge) return prediction;
+  if (!nudge) {
+    return { ...prediction, setting: Math.round(clampToSafeMin(prediction.setting, grinder) * 100) / 100 };
+  }
   const shift = nudge.avg * 0.5;
   const nudged = roundToStep(prediction.setting + shift, grinder);
   return {
     ...prediction,
-    setting: Math.round(nudged * 100) / 100,
+    setting: Math.round(clampToSafeMin(nudged, grinder) * 100) / 100,
     nudgeApplied: Math.round(shift * 100) / 100,
     nudgeSampleCount: nudge.count,
   };
@@ -539,19 +560,12 @@ function guessSettingRough(db, beanId, grinderId, targetGrinder) {
 
   const targetRoastVal = roastValueOf(target);
 
-  // Prioritas 1: kedekatan density (terbukti akurat 2x berturut-turut).
-  // Prioritas 2: roast (nilai 0-100 kontinu) sebagai tie-breaker — BUKAN
-  // penentu utama, karena korelasi density↔roast belum terbukti.
-  candidates.sort((a, b) => {
-    const diffA = Math.abs(a.density - targetDensity);
-    const diffB = Math.abs(b.density - targetDensity);
-    if (diffA !== diffB) return diffA - diffB;
-    const aRoastVal = roastValueOf(a.bean);
-    const bRoastVal = roastValueOf(b.bean);
-    const aRoastDiff = targetRoastVal !== null && aRoastVal !== null ? Math.abs(aRoastVal - targetRoastVal) : 999;
-    const bRoastDiff = targetRoastVal !== null && bRoastVal !== null ? Math.abs(bRoastVal - targetRoastVal) : 999;
-    return aRoastDiff - bRoastDiff;
-  });
+  // Murni kedekatan density — roast SAMA SEKALI nggak dipakai buat milih
+  // bean pembanding, walau lagi seri. Density dianggap sinyal paling
+  // dipercaya buat nyari bean paling mirip; roast cuma dipakai belakangan
+  // sebagai catatan tambahan (lihat roughRoastSuggestion di bawah), bukan
+  // buat nentuin siapa yang menang di tahap ini.
+  candidates.sort((a, b) => Math.abs(a.density - targetDensity) - Math.abs(b.density - targetDensity));
 
   const nearest = candidates[0];
   // Kalibrasi dari pengalaman pemakaian: tebakan kasar biasanya kegedean
@@ -559,21 +573,15 @@ function guessSettingRough(db, beanId, grinderId, targetGrinder) {
   // sebelum dibulatkan ke step grinder yang valid.
   const step = parseFloat(targetGrinder?.stepSize) || 1;
   const densityAdjusted = nearest.settingNum - step;
+  const roundedMain = roundToStep(densityAdjusted, targetGrinder);
+  const mainSetting = Math.round(clampToSafeMin(roundedMain, targetGrinder) * 100) / 100;
 
-  // Koreksi tambahan berdasarkan selisih level roast — EKSPERIMENTAL,
-  // dikalibrasi dari 2 pasangan data:
-  // 1) Robusfer batch1(Medium)→batch3(Medium-Dark): density turun + roast
-  //    lebih gelap, butuh jauh lebih kasar.
-  // 2) Kopi Turki (Light, roastColor 0) vs Robusfer batch3 (Medium-Dark,
-  //    roastColor 75) — density HAMPIR IDENTIK (0.40 vs 0.404), jadi ini
-  //    pasangan paling bersih buat isolasi efek roast doang: basis density
-  //    murni memprediksi ~2.75, tapi hasil asli yang works cuma 1.75 (roast
-  //    lebih terang → jauh lebih halus dari prediksi density-only).
-  // Nilai SHIFT dinaikkan dari 0.5 ke 1.0 berdasarkan data poin ke-2 ini
-  // (0.5 ternyata KEKECILAN, cuma prediksi 2.375 padahal butuh 1.75) —
-  // masih dibulatkan konservatif, bukan pas persis ke 1.33 hasil hitung
-  // exact, karena baru 2 data poin. Akan makin akurat begitu ada lebih
-  // banyak pasangan data buat dikalibrasi ulang.
+  // Koreksi berdasarkan selisih roast — SEKARANG CUMA JADI SARAN TAMBAHAN
+  // (roughRoastSuggestion), BUKAN otomatis masuk ke angka utama. Baru
+  // ditopang 2 pasangan data historis, dan ada dugaan salah satunya
+  // kena masalah roasting nggak merata — jadi nggak dipaksa jadi bagian
+  // dari angka yang ditampilin gede, biar user yang mutusin mau pakai
+  // pertimbangan ini atau enggak.
   const ROAST_LEVEL_STEP_SHIFT = 1.0; // per 25 poin roastColor (~1 level), dalam satuan step grinder
   const nearestRoastVal = roastValueOf(nearest.bean);
   let roastAdjustment = 0;
@@ -581,18 +589,17 @@ function guessSettingRough(db, beanId, grinderId, targetGrinder) {
     const roastDiff = targetRoastVal - nearestRoastVal; // positif = target lebih gelap dari basis
     roastAdjustment = (roastDiff / 25) * ROAST_LEVEL_STEP_SHIFT * step;
   }
-
-  const adjusted = densityAdjusted + roastAdjustment;
-  const rounded = roundToStep(adjusted, targetGrinder);
+  const roastRounded = roundToStep(densityAdjusted + roastAdjustment, targetGrinder);
+  const roastSuggestedSetting = Math.round(clampToSafeMin(roastRounded, targetGrinder) * 100) / 100;
 
   return {
     type: "rough",
-    setting: Math.round(rounded * 100) / 100,
+    setting: mainSetting,
     basedOnBeanName: nearest.bean.name,
     basedOnDensity: nearest.density,
     basedOnRoast: nearest.bean.roast || null,
     sameRoast: !!(target.roast && nearest.bean.roast === target.roast),
-    roastAdjustmentApplied: roastAdjustment !== 0 ? Math.round(roastAdjustment * 100) / 100 : 0,
+    roughRoastSuggestion: roastSuggestedSetting !== mainSetting ? roastSuggestedSetting : null,
     candidateCount: candidates.length,
   };
 }
@@ -2012,6 +2019,7 @@ function grinderToRow(g) {
     burr_size: g.burrSize || "",
     step_size: g.stepSize ?? "1",
     inner_burr: g.innerBurr || "",
+    min_safe_setting: g.minSafeSetting || "",
     restricted_to_machine_id: g.restrictedToMachineId || null,
     notes: g.notes || "",
   };
@@ -2024,6 +2032,7 @@ function rowToGrinder(r) {
     burrSize: r.burr_size,
     stepSize: r.step_size,
     innerBurr: r.inner_burr,
+    minSafeSetting: r.min_safe_setting,
     restrictedToMachineId: r.restricted_to_machine_id || "",
     notes: r.notes,
   };
@@ -3025,8 +3034,13 @@ function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
                       🧪 Tebakan kasar — belum tervalidasi
                     </div>
                     <div className="text-[11px] mt-2" style={{ color: "#736657" }}>
-                      Berdasarkan density terdekat: {prediction.basedOnBeanName} (d={Math.round(prediction.basedOnDensity * 100)}{prediction.sameRoast ? ", roast sama" : ""}) · bukan hasil seduhan langsung
+                      Berdasarkan density terdekat: {prediction.basedOnBeanName} (d={Math.round(prediction.basedOnDensity * 100)}) · bukan hasil seduhan langsung
                     </div>
+                    {prediction.roughRoastSuggestion != null && (
+                      <div className="text-[11px] mt-1" style={{ color: "#B8763C" }}>
+                        🎨 Kalau mempertimbangkan roast: sekitar {prediction.roughRoastSuggestion} (opsional, belum tentu lebih akurat)
+                      </div>
+                    )}
                     <NudgeNote prediction={prediction} />
                   </>
                 )}
@@ -3667,8 +3681,13 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
                   🧪 Tebakan kasar — belum tervalidasi
                 </div>
                 <div className="text-[11px] mt-2" style={{ color: "#736657" }}>
-                  Berdasarkan density terdekat: {prediction.basedOnBeanName} (d={Math.round(prediction.basedOnDensity * 100)}{prediction.sameRoast ? ", roast sama" : ""})
+                  Berdasarkan density terdekat: {prediction.basedOnBeanName} (d={Math.round(prediction.basedOnDensity * 100)})
                 </div>
+                {prediction.roughRoastSuggestion != null && (
+                  <div className="text-[11px] mt-1" style={{ color: "#B8763C" }}>
+                    🎨 Kalau mempertimbangkan roast: sekitar {prediction.roughRoastSuggestion} (opsional, belum tentu lebih akurat)
+                  </div>
+                )}
                 <NudgeNote prediction={prediction} />
               </>
             ) : (
@@ -4011,6 +4030,7 @@ const FORM_SCHEMAS = {
     { key: "burrSize", label: "Ukuran burr (mm)", placeholder: "cth. 64" },
     { key: "stepSize", label: "Step size", placeholder: "cth. 0.25" },
     { key: "innerBurr", label: "Setting Inner Burr saat ini (kalau ada, mis. grinder Breville)", placeholder: "cth. 4" },
+    { key: "minSafeSetting", label: "Setting minimum aman (batas paling halus, biar prediksi nggak nyaranin lebih halus dari ini)", placeholder: "cth. 0.5" },
     { key: "restrictedToMachineId", label: "Khusus mesin (kosongkan kalau bisa semua)", ref: "machines" },
     { key: "notes", label: "Catatan", textarea: true },
   ],
