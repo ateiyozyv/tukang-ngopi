@@ -2011,15 +2011,29 @@ function rowToBean(r) {
     updatedAt: r.updated_at,
   };
 }
+
+// Normalisasi koma jadi titik buat field yang isinya angka desimal.
+// Keyboard HP Indonesia defaultnya nulis koma buat desimal (mis. "2,75"),
+// tapi parseFloat("2,75") di JavaScript cuma kebaca "2" — sisa desimalnya
+// ilang diam-diam, bisa bikin salah pilih recipe/salah hitung tanpa ada
+// error yang kelihatan. Dipanggil sebelum data numerik disimpen ke Supabase,
+// supaya yang kesimpen selalu format titik, apa pun cara user ngetiknya.
+function normalizeDecimal(v) {
+  if (v === null || v === undefined) return v;
+  const s = String(v);
+  if (s.trim() === "") return s;
+  return s.replace(/,/g, ".");
+}
+
 function grinderToRow(g) {
   return {
     id: g.id,
     name: g.name || "",
     burr_type: g.burrType || "",
     burr_size: g.burrSize || "",
-    step_size: g.stepSize ?? "1",
-    inner_burr: g.innerBurr || "",
-    min_safe_setting: g.minSafeSetting || "",
+    step_size: normalizeDecimal(g.stepSize) ?? "1",
+    inner_burr: normalizeDecimal(g.innerBurr) || "",
+    min_safe_setting: normalizeDecimal(g.minSafeSetting) || "",
     restricted_to_machine_id: g.restrictedToMachineId || null,
     notes: g.notes || "",
   };
@@ -2049,10 +2063,10 @@ function recipeToRow(rec) {
     bean_id: rec.beanId || null,
     grinder_id: rec.grinderId || null,
     machine_id: rec.machineId || null,
-    setting: rec.setting != null ? String(rec.setting) : "",
-    dose: rec.dose || "",
-    yield: rec.yield || "",
-    time: rec.time || "",
+    setting: rec.setting != null ? normalizeDecimal(String(rec.setting)) : "",
+    dose: normalizeDecimal(rec.dose) || "",
+    yield: normalizeDecimal(rec.yield) || "",
+    time: normalizeDecimal(rec.time) || "",
     wdt: rec.wdt || "",
     puck: rec.puck || "",
     basket: rec.basket || "",
@@ -2062,8 +2076,8 @@ function recipeToRow(rec) {
     status: rec.status || "Experiment",
     is_default: !!rec.isDefault,
     notes: rec.notes || "",
-    inner_burr: rec.innerBurr || "",
-    predicted_setting: rec.predictedSetting != null ? String(rec.predictedSetting) : "",
+    inner_burr: normalizeDecimal(rec.innerBurr) || "",
+    predicted_setting: rec.predictedSetting != null ? normalizeDecimal(String(rec.predictedSetting)) : "",
     prediction_type: rec.predictionType || "",
     date: rec.date || new Date().toISOString(),
   };
@@ -2102,10 +2116,10 @@ function brewToRow(b) {
     machine_id: b.machineId || null,
     size: b.size || "",
     feedback: b.feedback || "",
-    dose: b.dose || "",
-    yield: b.yield || "",
-    time: b.time || "",
-    inner_burr: b.innerBurr || "",
+    dose: normalizeDecimal(b.dose) || "",
+    yield: normalizeDecimal(b.yield) || "",
+    time: normalizeDecimal(b.time) || "",
+    inner_burr: normalizeDecimal(b.innerBurr) || "",
     date: b.date || new Date().toISOString(),
   };
 }
@@ -2992,7 +3006,7 @@ function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
                     className="inline-flex items-center gap-1.5 mt-4 rounded-full text-xs px-3 py-1.5"
                     style={{ backgroundColor: "#F5E6D8", color: "#B8763C" }}
                   >
-                    ⚖️ Disesuaikan dari data dose {prediction.recipe.dose}g ke ~{targetDose}g
+                    ⚖️ Setting disesuaikan dari data dose {prediction.recipe.dose}g ke target ~{targetDose}g
                   </div>
                 )}
                 {doseAdjusted == null && prediction.type === "exact" && prediction.recipe.status === "Experiment" && (
@@ -3600,7 +3614,7 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
                   </div>
                 </div>
                 <div className="text-xs mt-1" style={{ color: "#6B6058" }}>
-                  {doseAdjusted != null ? "Disesuaikan dari data dose beda" : "Setting terbaik yang tercatat"}
+                  {doseAdjusted != null ? `Setting disesuaikan dari data dose ${prediction.recipe.dose}g ke target ~${targetDose}g` : "Setting terbaik yang tercatat"}
                 </div>
                 {innerBurrMismatch && (
                   <div
@@ -3608,11 +3622,6 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
                     style={{ backgroundColor: "#FBEADD", color: "#B5493A" }}
                   >
                     ⚠️ Inner burr sekarang ({grinder.innerBurr}) beda dari saat data ini dicatat ({prediction.recipe.innerBurr})
-                  </div>
-                )}
-                {doseAdjusted != null && (
-                  <div className="text-[11px] mt-2" style={{ color: "#736657" }}>
-                    Dari recipe dose {prediction.recipe.dose}g → target ~{targetDose}g
                   </div>
                 )}
                 <div
