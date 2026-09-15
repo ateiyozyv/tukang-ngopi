@@ -476,6 +476,12 @@ function predictSetting(db, beanId, grinderId, machineId, shotType) {
     ),
   ];
   for (const otherGrinderId of otherGrinderIds) {
+    // Grinder yang ditandai "jangan jadi rujukan" (mis. Cafeller — jarang
+    // dipakai, datanya belum bisa dipercaya jadi basis) boleh tetap MENERIMA
+    // prediksi (jadi target/grinderId), tapi datanya nggak boleh dipakai buat
+    // mem-bridge/nebak setting grinder LAIN.
+    const sourceGrinder = db.grinders.find((g) => g.id === otherGrinderId);
+    if (sourceGrinder?.excludeAsReference === "Ya") continue;
     const r = findBestRecipe(db, beanId, otherGrinderId);
     if (!r) continue;
     const bridge = findBridgeRatio(db, r.grinderId, grinderId);
@@ -2035,6 +2041,7 @@ function grinderToRow(g) {
     inner_burr: normalizeDecimal(g.innerBurr) || "",
     min_safe_setting: normalizeDecimal(g.minSafeSetting) || "",
     restricted_to_machine_id: g.restrictedToMachineId || null,
+    exclude_as_reference: g.excludeAsReference === "Ya",
     notes: g.notes || "",
   };
 }
@@ -2048,6 +2055,7 @@ function rowToGrinder(r) {
     innerBurr: r.inner_burr,
     minSafeSetting: r.min_safe_setting,
     restrictedToMachineId: r.restricted_to_machine_id || "",
+    excludeAsReference: r.exclude_as_reference ? "Ya" : "Tidak",
     notes: r.notes,
   };
 }
@@ -4041,6 +4049,7 @@ const FORM_SCHEMAS = {
     { key: "innerBurr", label: "Setting Inner Burr saat ini (kalau ada, mis. grinder Breville)", placeholder: "cth. 4" },
     { key: "minSafeSetting", label: "Setting minimum aman (batas paling halus, biar prediksi nggak nyaranin lebih halus dari ini)", placeholder: "cth. 0.5" },
     { key: "restrictedToMachineId", label: "Khusus mesin (kosongkan kalau bisa semua)", ref: "machines" },
+    { key: "excludeAsReference", label: "Jangan jadikan rujukan buat prediksi grinder lain (grinder ini tetap bisa dapat prediksinya sendiri)", options: ["Tidak", "Ya"], default: "Tidak" },
     { key: "notes", label: "Catatan", textarea: true },
   ],
   machines: [
