@@ -515,7 +515,7 @@ function predictSetting(db, beanId, grinderId, machineId, shotType) {
         }
 
         if (deltaSetting == null) {
-          const suggestion = suggestNextGrindShift(exact.time, exactShotType, targetGrinder);
+          const suggestion = suggestNextGrindShift(result, exactShotType, targetGrinder);
           if (suggestion) deltaSetting = suggestion.direction === "finer" ? -suggestion.stepDelta : suggestion.stepDelta;
         }
 
@@ -3129,7 +3129,7 @@ function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
                     📐 Digeser dari {prediction.recipe.setting}
                     {prediction.adjustmentBasis
                       ? ` — dihitung dari ${prediction.adjustmentBasis.count} trial bean ini`
-                      : " — estimasi 1 step (baru 1 trial, belum cukup data buat dihitung)"}
+                      : " — estimasi 1 step (rasio/waktu belum cukup buat dihitung presisi)"}
                   </div>
                 )}
                 {doseAdjusted == null && prediction.type === "exact" && prediction.recipe.status === "Experiment" && (
@@ -3441,13 +3441,28 @@ function classifyShotResult(dose, yieldVal, time) {
 // (1 step grinder ke arah yang benar), BUKAN hasil kalkulasi presisi —
 // nggak ada data kalibrasi detik-per-step, jadi cuma dikasih arah + 1 step
 // kecil sebagai titik awal coba-coba berikutnya.
-function suggestNextGrindShift(actualTime, targetShotType, grinder) {
-  const range = SHOT_TIME_RANGE[targetShotType];
-  const t = parseFloat(actualTime);
-  if (!range || isNaN(t)) return null;
+// Nerima objek `result` dari classifyShotResult (bukan cuma waktu mentah),
+// karena ada kasus waktu-nya udah pas rentang shot type yang diniatkan,
+// tapi RASIO-nya yang meleset jauh (biasanya tanda channeling/aliran nggak
+// wajar — persis kasus "waktu mirip Espresso tapi rasio mirip Lungo").
+// Kalau cuma ngecek waktu doang, kasus kayak gitu nggak pernah dapet saran
+// arah sama sekali walau jelas-jelas ditandai bermasalah. Jadi: waktu jadi
+// acuan utama; kalau waktu udah pas tapi rasio meleset, pakai rasio buat
+// nentuin arahnya (rasio kegedean → lebih halus, rasio kekecilan → lebih kasar).
+function suggestNextGrindShift(result, targetShotType, grinder) {
+  if (!result) return null;
   const step = parseFloat(grinder?.stepSize) || 1;
-  if (t < range[0]) return { direction: "finer", stepDelta: step };
-  if (t > range[1]) return { direction: "coarser", stepDelta: step };
+  const timeRange = SHOT_TIME_RANGE[targetShotType];
+  const t = parseFloat(result.time);
+  if (timeRange && !isNaN(t)) {
+    if (t < timeRange[0]) return { direction: "finer", stepDelta: step };
+    if (t > timeRange[1]) return { direction: "coarser", stepDelta: step };
+  }
+  const ratioRange = SHOT_RATIO_RANGE[targetShotType];
+  if (ratioRange && result.ratio != null) {
+    if (result.ratio > ratioRange[1]) return { direction: "finer", stepDelta: step };
+    if (result.ratio < ratioRange[0]) return { direction: "coarser", stepDelta: step };
+  }
   return null;
 }
 
@@ -3775,7 +3790,7 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
                     ? `Digeser dari ${prediction.recipe.setting}${
                         prediction.adjustmentBasis
                           ? ` — dihitung dari ${prediction.adjustmentBasis.count} trial bean ini`
-                          : " — estimasi 1 step (baru 1 trial, belum cukup data buat dihitung)"
+                          : " — estimasi 1 step (rasio/waktu belum cukup buat dihitung presisi)"
                       }`
                     : "Setting terbaik yang tercatat"}
                 </div>
@@ -4041,7 +4056,7 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
             const flagged = mismatch || result.conflict;
             if (!flagged) return null;
             const goodDespiteMismatch = rating != null && rating >= 9;
-            const suggestion = mismatch && !goodDespiteMismatch ? suggestNextGrindShift(result.time, shotType, grinder) : null;
+            const suggestion = !goodDespiteMismatch ? suggestNextGrindShift(result, shotType, grinder) : null;
             return (
               <div
                 className="rounded-2xl px-4 py-3.5 mb-6"
