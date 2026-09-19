@@ -3475,6 +3475,7 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
   const grinder = db.grinders.find((g) => g.id === grinderId);
   const prediction = beanId && grinderId && machineId && shotType ? predictSetting(db, beanId, grinderId, machineId, shotType) : null;
   const availableBeans = sortBeansByRecentActivity(db, db.beans.filter((b) => !b.outOfStock));
+  const shotTypeTags = bean ? suggestShotTypeTags(bean) : {};
 
   // Sama kayak Bikin Kopi: kalau ada recipe asli (exact) dengan dose beda
   // dari target ukuran yang dipilih, geser settingnya sebagai titik awal.
@@ -3704,6 +3705,11 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
 
       {step === "shotType" && (
         <div className="px-5 space-y-2.5">
+          {Object.keys(shotTypeTags).length > 0 && (
+            <div className="text-xs mb-1" style={{ color: "#6B6058" }}>
+              💡 Tag di bawah saran umum dari referensi barista (roast bean ini), bukan dari data seduhan kamu sendiri.
+            </div>
+          )}
           {SHOT_TYPES.map((t) => (
             <button
               key={t.key}
@@ -3719,6 +3725,14 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
               </div>
               {t.hint && (
                 <div className="text-xs mt-1" style={{ color: "#6B6058" }}>{t.hint}</div>
+              )}
+              {shotTypeTags[t.key] && (
+                <div
+                  className="inline-flex items-center gap-1.5 mt-2 rounded-full text-xs px-3 py-1.5"
+                  style={{ backgroundColor: "#F5E6D8", color: "#B8763C", fontWeight: 600 }}
+                >
+                  {shotTypeTags[t.key]}
+                </div>
               )}
             </button>
           ))}
@@ -4210,6 +4224,34 @@ function nearestRoastLabel(value) {
   return ROAST_LEVELS[idx]?.key || "Medium";
 }
 const ROAST_GRADIENT_CSS = `linear-gradient(to right, ${ROAST_LEVELS.map((r) => r.color).join(", ")})`;
+
+// Saran jenis shot berdasarkan REFERENSI UMUM barista (bukan dari data
+// seduhan pribadi) — sinyalnya roastColor bean (0 = paling terang, 100 =
+// paling gelap):
+// - Roast terang-menengah → Ristretto & Turbo Shot cenderung lebih cocok
+//   (nonjolin acidity/kompleksitas bean terang). Turbo Shot butuh gilingan
+//   JAUH lebih kasar dari biasanya (bukan sekadar geser dikit) — biar flow
+//   makin deras sampai tekanan alami mesin ikut turun sendiri, nggak wajib
+//   punya katup tekanan manual, tapi hasilnya bisa nggak konsisten kalau
+//   belum ketemu titik yang pas.
+// - Roast gelap-menengah → Lungo cenderung lebih cocok (sweetness & body
+//   udah lebih terbentuk dari proses roasting, air lebih banyak nggak
+//   bikin pahit berlebih).
+// - Roast di tengah, atau data roast belum diisi → nggak ada saran spesifik;
+//   Espresso tetap pilihan default yang aman buat semua kasus.
+function suggestShotTypeTags(bean) {
+  const roastVal = roastValueOf(bean);
+  if (roastVal === null) return {};
+  const tags = {};
+  if (roastVal <= 40) {
+    tags["Ristretto"] = "✨ Kemungkinan cocok — roast lebih terang, biasanya lebih asam & padat";
+    tags["Turbo Shot"] = "✨ Cocok buat eksplor — coba gilingan JAUH lebih kasar dari biasanya (bukan geser dikit)";
+  }
+  if (roastVal >= 60) {
+    tags["Lungo"] = "✨ Kemungkinan cocok — roast lebih gelap, biasanya sweetness & body udah kebentuk";
+  }
+  return tags;
+}
 
 const FORM_SCHEMAS = {
   beans: [
