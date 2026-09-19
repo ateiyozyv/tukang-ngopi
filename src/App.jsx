@@ -474,17 +474,19 @@ function predictSetting(db, beanId, grinderId, machineId, shotType) {
   // Tahap 0: exact match buat jenis shot ini persis.
   const exact = findBestRecipe(db, beanId, grinderId, machineId, shotType);
   if (exact) {
-    // Recipe ini ground truth kalau sudah jadi default ATAU rating-nya
-    // udah ≥9 (bener-bener enak) — dipakai apa adanya. Kalau masih
-    // "Experiment" dan belum seenak itu, DAN hasil aslinya ternyata
-    // meleset dari shot type yang diniatkan waktu itu, angka yang
-    // di-prefill ke Dial-In berikutnya digeser dulu — dihitung dari slope
-    // waktu-per-step lokal bean+grinder+mesin ini kalau datanya udah
-    // cukup (≥2 trial setting beda), atau estimasi flat 1 step kalau
-    // belum (baru trial pertama, belum ada 2 titik buat ditarik garis).
+    // "Settled" (jangan disaranin geser) ditentuin MURNI dari rating ≥9 —
+    // bener-bener enak, terlepas dari kategori shot-nya meleset atau enggak.
+    // `isDefault` SENGAJA tidak dipakai di sini: bean bisa berubah karakter
+    // seiring waktu (degassing dll), dan status default cuma berarti "ini
+    // yang lagi dipakai", bukan "ini kebukti masih pas sekarang". Jadi kalau
+    // hasil TERBARU yang dicatat ternyata meleset dari shot type yang
+    // diniatkan (meski recipe-nya kebetulan default), tetap disaranin
+    // geser buat percobaan berikutnya — dihitung dari slope waktu-per-step
+    // lokal bean+grinder+mesin ini kalau datanya udah cukup (≥2 trial
+    // setting beda), atau estimasi flat 1 step kalau belum.
     const exactShotType = exact.shotType || "Espresso";
     const ratingNum = exact.rating != null && exact.rating !== "" ? Number(exact.rating) : null;
-    const isSettled = exact.isDefault || (ratingNum != null && ratingNum >= 9);
+    const isSettled = ratingNum != null && ratingNum >= 9;
     let adjustedSetting = null;
     let adjustmentBasis = null;
     if (!isSettled) {
