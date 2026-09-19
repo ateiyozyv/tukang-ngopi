@@ -433,12 +433,99 @@ function applyDeviationNudge(prediction, db, grinder) {
   };
 }
 
+// Regresi linier sederhana (least squares) waktu vs setting, KHUSUS buat
+// SATU kombinasi bean+grinder+mesin+shotType — bukan rumus global lintas
+// semua kopi (itu udah pernah dicoba, R²=0.094, kebukti nggak reliable
+// karena basket/WDT/retained coffee/suhu ikut berubah-ubah antar kopi).
+// Dibatasi ke satu kombinasi yang sama, variabel pengganggu itu kemungkinan
+// besar konsisten (setup yang sama, dipakai berturut-turut), jadi slope
+// waktu-per-setting dari data bean itu sendiri jauh lebih bisa dipercaya.
+// Butuh minimal 2 titik data dengan setting BEDA biar bisa ditarik garis;
+// kalau belum cukup, balikin null (caller fallback ke estimasi flat 1 step).
+function estimateLocalTimePerStep(db, beanId, grinderId, machineId, shotType) {
+  const points = db.recipes
+    .filter(
+      (r) =>
+        r.beanId === beanId &&
+        r.grinderId === grinderId &&
+        r.machineId === machineId &&
+        (r.shotType || "Espresso") === shotType
+    )
+    .map((r) => ({ x: parseFloat(r.setting), y: parseFloat(r.time) }))
+    .filter((p) => !isNaN(p.x) && !isNaN(p.y));
+
+  const distinctX = new Set(points.map((p) => p.x));
+  if (points.length < 2 || distinctX.size < 2) return null;
+
+  const n = points.length;
+  const meanX = points.reduce((s, p) => s + p.x, 0) / n;
+  const meanY = points.reduce((s, p) => s + p.y, 0) / n;
+  const num = points.reduce((s, p) => s + (p.x - meanX) * (p.y - meanY), 0);
+  const den = points.reduce((s, p) => s + (p.x - meanX) * (p.x - meanX), 0);
+  if (den === 0) return null;
+  const secondsPerUnit = num / den; // detik per 1 unit setting, bukan per step
+  if (!isFinite(secondsPerUnit) || secondsPerUnit === 0) return null;
+  return { secondsPerUnit, count: n };
+}
+
 function predictSetting(db, beanId, grinderId, machineId, shotType) {
   const targetGrinder = db.grinders.find((g) => g.id === grinderId);
 
   // Tahap 0: exact match buat jenis shot ini persis.
   const exact = findBestRecipe(db, beanId, grinderId, machineId, shotType);
-  if (exact) return { type: "exact", recipe: exact };
+  if (exact) {
+    // Recipe ini ground truth kalau sudah jadi default ATAU rating-nya
+    // udah ≥9 (bener-bener enak) — dipakai apa adanya. Kalau masih
+    // "Experiment" dan belum seenak itu, DAN hasil aslinya ternyata
+    // meleset dari shot type yang diniatkan waktu itu, angka yang
+    // di-prefill ke Dial-In berikutnya digeser dulu — dihitung dari slope
+    // waktu-per-step lokal bean+grinder+mesin ini kalau datanya udah
+    // cukup (≥2 trial setting beda), atau estimasi flat 1 step kalau
+    // belum (baru trial pertama, belum ada 2 titik buat ditarik garis).
+    const exactShotType = exact.shotType || "Espresso";
+    const ratingNum = exact.rating != null && exact.rating !== "" ? Number(exact.rating) : null;
+    const isSettled = exact.isDefault || (ratingNum != null && ratingNum >= 9);
+    let adjustedSetting = null;
+    let adjustmentBasis = null;
+    if (!isSettled) {
+      const result = classifyShotResult(exact.dose, exact.yield, exact.time);
+      const mismatch = result && !result.conflict && result.category !== "Lainnya" && result.category !== exactShotType;
+      if (result && (result.conflict || mismatch)) {
+        const step = parseFloat(targetGrinder?.stepSize) || 1;
+        const base = parseFloat(exact.setting);
+        const actualTime = parseFloat(exact.time);
+        const range = SHOT_TIME_RANGE[exactShotType];
+        let deltaSetting = null;
+
+        const local = estimateLocalTimePerStep(db, beanId, grinderId, machineId, exactShotType);
+        if (local && range && !isNaN(actualTime)) {
+          const targetTime = actualTime < range[0] ? range[0] : actualTime > range[1] ? range[1] : null;
+          if (targetTime != null) {
+            const rawDelta = (targetTime - actualTime) / local.secondsPerUnit;
+            // Sanity cap: kalau slope-nya kebetulan nyaris flat dan
+            // hasilnya minta geser >8 step sekaligus dalam satu lompatan,
+            // itu udah nggak masuk akal — jangan dipakai, balik ke flat.
+            if (isFinite(rawDelta) && Math.abs(rawDelta) / step <= 8) {
+              deltaSetting = rawDelta;
+              adjustmentBasis = { count: local.count };
+            }
+          }
+        }
+
+        if (deltaSetting == null) {
+          const suggestion = suggestNextGrindShift(exact.time, exactShotType, targetGrinder);
+          if (suggestion) deltaSetting = suggestion.direction === "finer" ? -suggestion.stepDelta : suggestion.stepDelta;
+        }
+
+        if (deltaSetting != null && !isNaN(base)) {
+          adjustedSetting = Math.round(clampToSafeMin(roundToStep(base + deltaSetting, targetGrinder), targetGrinder) * 100) / 100;
+        }
+      }
+    }
+    return adjustedSetting != null
+      ? { type: "exact", recipe: exact, adjustedSetting, adjustmentBasis }
+      : { type: "exact", recipe: exact };
+  }
 
   // Tahap 0.5: belum ada data buat jenis shot ini, tapi ada resep Espresso
   // biasa buat kombinasi yang sama — geser settingnya sesuai jenis shot.
@@ -558,6 +645,15 @@ function guessSettingRough(db, beanId, grinderId, targetGrinder) {
       if (!recipe) return null;
       const settingNum = parseFloat(recipe.setting);
       if (isNaN(settingNum)) return null;
+      // Bean yang udah habis DAN recipe-nya belum "settled" (belum default,
+      // rating belum ≥9) jangan dijadiin acuan buat nebak bean lain — data
+      // itu cuma tebakan sekali coba yang udah nggak bisa dites ulang lagi
+      // (bean-nya nggak ada), jadi jangan sampai keliatan meyakinkan padahal
+      // belum tentu bener. Kalau udah default/rating ≥9, tetap boleh dipakai
+      // meski bean-nya udah habis — datanya udah kebukti valid.
+      const ratingNum = recipe.rating != null && recipe.rating !== "" ? Number(recipe.rating) : null;
+      const settled = recipe.isDefault || (ratingNum != null && ratingNum >= 9);
+      if (b.outOfStock && !settled) return null;
       return { bean: b, density, recipe, settingNum };
     })
     .filter(Boolean);
@@ -2715,7 +2811,7 @@ function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
   const grinder = db.grinders.find((g) => g.id === grinderId);
   const machine = db.machines.find((m) => m.id === machineId);
   const prediction = beanId && grinderId && machineId ? predictSetting(db, beanId, grinderId, machineId) : null;
-  const availableBeans = db.beans.filter((b) => !b.outOfStock);
+  const availableBeans = sortBeansByRecentActivity(db, db.beans.filter((b) => !b.outOfStock));
 
   // Kalau prediksinya "exact" (ada recipe asli) dan dose recipe itu beda
   // dari dose target ukuran yang dipilih, geser settingnya sesuai
@@ -2723,9 +2819,15 @@ function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
   // dose baseline yang jelas buat jadi patokan geser.
   const targetDose = resolveTargetDose(size, customDose);
   const baseDoseForAdjust = prediction?.type === "exact" ? parseFloat(prediction.recipe.dose) : null;
+  const exactBaseSetting =
+    prediction?.type === "exact"
+      ? prediction.adjustedSetting != null
+        ? prediction.adjustedSetting
+        : parseFloat(prediction.recipe.setting)
+      : null;
   const doseAdjusted =
     prediction?.type === "exact" && targetDose != null
-      ? doseAdjustSetting(parseFloat(prediction.recipe.setting), baseDoseForAdjust, targetDose, grinder)
+      ? doseAdjustSetting(exactBaseSetting, baseDoseForAdjust, targetDose, grinder)
       : null;
 
   // Kalau recipe yang lagi ditampilkan dicatat waktu inner burr grinder ini
@@ -2996,7 +3098,7 @@ function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
                     className="text-6xl"
                     style={{ fontFamily: "'IBM Plex Mono', monospace", fontWeight: 600, color: "#2A2118" }}
                   >
-                    {doseAdjusted != null ? doseAdjusted : prediction.type === "exact" ? prediction.recipe.setting : prediction.setting}
+                    {doseAdjusted != null ? doseAdjusted : prediction.type === "exact" ? exactBaseSetting : prediction.setting}
                   </div>
                 </div>
                 <div className="text-xs mt-1" style={{ color: "#6B6058" }}>Putaran grinder</div>
@@ -3015,6 +3117,17 @@ function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
                     style={{ backgroundColor: "#F5E6D8", color: "#B8763C" }}
                   >
                     ⚖️ Setting disesuaikan dari data dose {prediction.recipe.dose}g ke target ~{targetDose}g
+                  </div>
+                )}
+                {doseAdjusted == null && prediction.type === "exact" && prediction.adjustedSetting != null && (
+                  <div
+                    className="inline-flex items-center gap-1.5 mt-4 rounded-full text-xs px-3 py-1.5"
+                    style={{ backgroundColor: "#F5E6D8", color: "#B8763C" }}
+                  >
+                    📐 Digeser dari {prediction.recipe.setting}
+                    {prediction.adjustmentBasis
+                      ? ` — dihitung dari ${prediction.adjustmentBasis.count} trial bean ini`
+                      : " — estimasi 1 step (baru 1 trial, belum cukup data buat dihitung)"}
                   </div>
                 )}
                 {doseAdjusted == null && prediction.type === "exact" && prediction.recipe.status === "Experiment" && (
@@ -3292,12 +3405,24 @@ function classifyShotResult(dose, yieldVal, time) {
   }
 
   // Waktu & rasio nggak sinkron — cari kategori mana yang rasionya cocok,
-  // buat dijelasin di catatan konflik.
+  // buat dijelasin di catatan konflik. Rentang rasio antar kategori sengaja
+  // tumpang tindih (mis. Turbo Shot & Lungo sama-sama bisa rasio ~2,5-3,5,
+  // karena Turbo Shot memang "yield ala Lungo tapi dikejar cepat"), jadi
+  // kalau lebih dari satu kategori cocok secara rasio, menangnya yang
+  // rentang WAKTUnya paling deket ke waktu aktual — bukan asal comot yang
+  // pertama ketemu di objek (itu bisa nyasar, misal shot 27 detik malah
+  // dibilang "mirip Turbo Shot" padahal jauh lebih masuk akal "mirip Lungo").
+  const ratioCandidates = Object.keys(SHOT_RATIO_RANGE).filter((k) => {
+    const rr = SHOT_RATIO_RANGE[k];
+    return ratio >= rr[0] && ratio <= rr[1];
+  });
   const ratioCategory =
-    Object.keys(SHOT_RATIO_RANGE).find((k) => {
-      const rr = SHOT_RATIO_RANGE[k];
-      return ratio >= rr[0] && ratio <= rr[1];
-    }) || null;
+    ratioCandidates.length === 0
+      ? null
+      : ratioCandidates.reduce((best, k) => {
+          const midOf = (key) => (SHOT_TIME_RANGE[key][0] + SHOT_TIME_RANGE[key][1]) / 2;
+          return Math.abs(midOf(k) - t) < Math.abs(midOf(best) - t) ? k : best;
+        });
 
   return {
     category: "Lainnya",
@@ -3341,7 +3466,7 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
     puck: "Kertas",
     basket: "Standard",
   });
-  const [taste, setTaste] = useState(null);
+  const [taste, setTaste] = useState([]);
   const [rating, setRating] = useState(null);
   const [savedRecipe, setSavedRecipe] = useState(null);
   const [taste2Notes, setTaste2Notes] = useState("");
@@ -3349,15 +3474,21 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
   const bean = db.beans.find((b) => b.id === beanId);
   const grinder = db.grinders.find((g) => g.id === grinderId);
   const prediction = beanId && grinderId && machineId && shotType ? predictSetting(db, beanId, grinderId, machineId, shotType) : null;
-  const availableBeans = db.beans.filter((b) => !b.outOfStock);
+  const availableBeans = sortBeansByRecentActivity(db, db.beans.filter((b) => !b.outOfStock));
 
   // Sama kayak Bikin Kopi: kalau ada recipe asli (exact) dengan dose beda
   // dari target ukuran yang dipilih, geser settingnya sebagai titik awal.
   const targetDose = resolveTargetDose(size, customDose);
   const baseDoseForAdjust = prediction?.type === "exact" ? parseFloat(prediction.recipe.dose) : null;
+  const exactBaseSetting =
+    prediction?.type === "exact"
+      ? prediction.adjustedSetting != null
+        ? prediction.adjustedSetting
+        : parseFloat(prediction.recipe.setting)
+      : null;
   const doseAdjusted =
     prediction?.type === "exact" && targetDose != null
-      ? doseAdjustSetting(parseFloat(prediction.recipe.setting), baseDoseForAdjust, targetDose, grinder)
+      ? doseAdjustSetting(exactBaseSetting, baseDoseForAdjust, targetDose, grinder)
       : null;
   const innerBurrMismatch =
     prediction?.type === "exact" &&
@@ -3374,7 +3505,7 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
     setCustomDose("");
     setShotType(null);
     setShot({ setting: "", dose: "", yield: "", time: "", wdt: "Ya", puck: "Kertas", basket: "Standard" });
-    setTaste(null);
+    setTaste([]);
     setRating(null);
     setSavedRecipe(null);
     setTaste2Notes("");
@@ -3414,7 +3545,7 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
       puck: shot.puck,
       basket: shot.basket,
       shotType: shotType || "Espresso",
-      taste,
+      taste: taste.join(", "),
       rating,
       status: "Experiment",
       isDefault: false,
@@ -3618,11 +3749,19 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
                     <CoffeeBeanIcon size={40} color={roastColorFromValue(bean.roastColor)} />
                   )}
                   <div className="text-6xl" style={{ fontFamily: "'IBM Plex Mono', monospace", fontWeight: 600, color: "#2A2118" }}>
-                    {doseAdjusted != null ? doseAdjusted : prediction.recipe.setting}
+                    {doseAdjusted != null ? doseAdjusted : exactBaseSetting}
                   </div>
                 </div>
                 <div className="text-xs mt-1" style={{ color: "#6B6058" }}>
-                  {doseAdjusted != null ? `Setting disesuaikan dari data dose ${prediction.recipe.dose}g ke target ~${targetDose}g` : "Setting terbaik yang tercatat"}
+                  {doseAdjusted != null
+                    ? `Setting disesuaikan dari data dose ${prediction.recipe.dose}g ke target ~${targetDose}g`
+                    : prediction.adjustedSetting != null
+                    ? `Digeser dari ${prediction.recipe.setting}${
+                        prediction.adjustmentBasis
+                          ? ` — dihitung dari ${prediction.adjustmentBasis.count} trial bean ini`
+                          : " — estimasi 1 step (baru 1 trial, belum cukup data buat dihitung)"
+                      }`
+                    : "Setting terbaik yang tercatat"}
                 </div>
                 {innerBurrMismatch && (
                   <div
@@ -3727,7 +3866,7 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
 
           <button
             onClick={() => {
-              if (prediction?.type === "exact") setShotField("setting", doseAdjusted != null ? String(doseAdjusted) : prediction.recipe.setting);
+              if (prediction?.type === "exact") setShotField("setting", doseAdjusted != null ? String(doseAdjusted) : String(exactBaseSetting));
               else if (prediction?.type === "bridge" || prediction?.type === "rough" || prediction?.type === "adjusted") setShotField("setting", String(prediction.setting));
               if (targetDose != null) setShotField("dose", String(targetDose));
               setStep("shot");
@@ -3758,11 +3897,14 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
           </Field>
 
           {(() => {
+            // Cuma info klasifikasi realtime di sini (belum tau rasanya
+            // enak apa nggak — itu baru diisi di step "evaluasi"). Saran
+            // geser grind sengaja TIDAK dimunculkan di sini, biar nggak
+            // keburu nyaranin geser sebelum tau hasilnya enak atau nggak.
             const result = classifyShotResult(shot.dose, shot.yield, shot.time);
             if (!result) return null;
             const mismatch = !result.conflict && shotType && shotType !== "Lainnya" && result.category !== shotType;
             const flagged = mismatch || result.conflict;
-            const suggestion = mismatch ? suggestNextGrindShift(result.time, shotType, grinder) : null;
             return (
               <div
                 className="rounded-2xl px-4 py-3.5"
@@ -3776,11 +3918,6 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
                     : `${result.time}s — masuk kategori ${result.category}`}
                   {mismatch && ` (kamu pilih ${shotType})`}
                 </div>
-                {suggestion && (
-                  <div className="text-xs mt-1.5" style={{ color: "#6B6058" }}>
-                    💡 Buat next kali ngejar {shotType}, coba geser {suggestion.direction === "finer" ? "lebih halus" : "lebih kasar"} ~{suggestion.stepDelta} step di {grinder?.name || "grinder ini"} — estimasi awal, bukan angka pasti.
-                  </div>
-                )}
               </div>
             );
           })()}
@@ -3835,23 +3972,26 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
 
       {step === "evaluasi" && (
         <div className="px-5">
-          <div className="text-xs mb-2.5" style={{ color: "#6B6058" }}>Rasa</div>
+          <div className="text-xs mb-2.5" style={{ color: "#6B6058" }}>Rasa (boleh pilih lebih dari satu)</div>
           <div className="grid grid-cols-2 gap-2.5 mb-6">
-            {TASTE_TAGS.map((tag) => (
-              <button
-                key={tag}
-                onClick={() => setTaste(tag)}
-                className="rounded-xl py-3 text-sm"
-                style={{
-                  backgroundColor: taste === tag ? "#C69163" : "transparent",
-                  color: taste === tag ? "#332C2A" : "#2A2118",
-                  border: `1px solid ${taste === tag ? "#C69163" : "#DDD6CE"}`,
-                  fontWeight: taste === tag ? 600 : 400,
-                }}
-              >
-                {tag}
-              </button>
-            ))}
+            {TASTE_TAGS.map((tag) => {
+              const active = taste.includes(tag);
+              return (
+                <button
+                  key={tag}
+                  onClick={() => setTaste((prev) => (prev.includes(tag) ? prev.filter((t) => t !== tag) : [...prev, tag]))}
+                  className="rounded-xl py-3 text-sm"
+                  style={{
+                    backgroundColor: active ? "#C69163" : "transparent",
+                    color: active ? "#332C2A" : "#2A2118",
+                    border: `1px solid ${active ? "#C69163" : "#DDD6CE"}`,
+                    fontWeight: active ? 600 : 400,
+                  }}
+                >
+                  {tag}
+                </button>
+              );
+            })}
           </div>
 
           <div className="text-xs mb-2.5" style={{ color: "#6B6058" }}>Seberapa enak? (1-10)</div>
@@ -3874,6 +4014,46 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
             ))}
           </div>
 
+          {(() => {
+            // Sekarang rating udah ada, jadi baru di sini kita putuskan:
+            // kalau meleset dari kategori tapi rating udah ≥9, jangan
+            // nyaranin geser grind — anggap kombinasi ini tetap layak jadi
+            // acuan apa adanya. Kalau belum seenak itu, baru saranin arah.
+            const result = classifyShotResult(shot.dose, shot.yield, shot.time);
+            if (!result) return null;
+            const mismatch = !result.conflict && shotType && shotType !== "Lainnya" && result.category !== shotType;
+            const flagged = mismatch || result.conflict;
+            if (!flagged) return null;
+            const goodDespiteMismatch = rating != null && rating >= 9;
+            const suggestion = mismatch && !goodDespiteMismatch ? suggestNextGrindShift(result.time, shotType, grinder) : null;
+            return (
+              <div
+                className="rounded-2xl px-4 py-3.5 mb-6"
+                style={{
+                  backgroundColor: goodDespiteMismatch ? "#E3F5EC" : "#FBEADD",
+                  border: `1px solid ${goodDespiteMismatch ? "#1F7A4C" : "#B8632E"}`,
+                }}
+              >
+                {goodDespiteMismatch ? (
+                  <div className="text-xs" style={{ color: "#1F7A4C" }}>
+                    ✅ Di luar rentang kategori standar {shotType}, tapi rasanya enak (rating {rating}) — kombinasi dose/yield/waktu ini tetap layak dijadiin acuan, nggak perlu digeser.
+                  </div>
+                ) : (
+                  <div className="text-xs" style={{ color: "#B8632E" }}>
+                    {result.conflict
+                      ? `⚠️ Waktu mirip ${result.timeCategory}, tapi rasio (~1:${Math.round(result.ratio * 100) / 100}) mirip ${result.ratioCategory || "kategori lain"} — kemungkinan aliran nggak wajar (channeling?)`
+                      : `Hasil masuk kategori ${result.category}, meleset dari target ${shotType}`}
+                  </div>
+                )}
+                {suggestion && (
+                  <div className="text-xs mt-1.5" style={{ color: "#6B6058" }}>
+                    💡 Buat next kali ngejar {shotType}, coba geser {suggestion.direction === "finer" ? "lebih halus" : "lebih kasar"} ~{suggestion.stepDelta} step di {grinder?.name || "grinder ini"} — estimasi awal, bukan angka pasti.
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+
           <div className="mb-6">
             <div className="text-xs mb-1.5" style={{ color: "#6B6058" }}>
               Catatan (opsional)
@@ -3889,12 +4069,12 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
 
           <button
             onClick={saveTrial}
-            disabled={!taste || !rating}
+            disabled={taste.length === 0 || !rating}
             className="w-full rounded-2xl py-4 text-sm font-semibold"
             style={{
-              backgroundColor: taste && rating ? "#C69163" : "#DDD6CE",
-              color: taste && rating ? "#332C2A" : "#736657",
-              cursor: taste && rating ? "pointer" : "not-allowed",
+              backgroundColor: taste.length > 0 && rating ? "#C69163" : "#DDD6CE",
+              color: taste.length > 0 && rating ? "#332C2A" : "#736657",
+              cursor: taste.length > 0 && rating ? "pointer" : "not-allowed",
             }}
           >
             Simpan
@@ -4321,7 +4501,7 @@ function ShotHistoryPanel({ db, persist, onEdit }) {
   const entries = db.recipes
     .filter((r) => {
       if (dateCutoff && (!r.date || new Date(r.date).getTime() < dateCutoff)) return false;
-      if (tasteFilter !== "all" && r.taste !== tasteFilter) return false;
+      if (tasteFilter !== "all" && !(r.taste || "").includes(tasteFilter)) return false;
       if (statusFilter !== "all" && (r.status || "Verified") !== statusFilter) return false;
       if (beanFilter !== "all" && r.beanId !== beanFilter) return false;
       if (shotTypeFilter !== "all" && (r.shotType || "Espresso") !== shotTypeFilter) return false;
@@ -4676,6 +4856,31 @@ function BrewHistoryPanel({ db, persist }) {
   );
 }
 
+// Aktivitas terakhir sebuah bean = yang paling baru di antara: kapan bean itu
+// sendiri diedit/ditambah, kapan terakhir dipakai di trial Dial-In (recipes),
+// atau kapan terakhir diseduh lewat Bikin Kopi (brews) — bukan cuma kapan
+// data bean-nya diutak-atik. Dipakai bareng di halaman Database maupun di
+// layar pemilihan bean (Bikin Kopi & Dial-In) biar urutannya konsisten.
+function lastBeanActivity(db, beanId, bean) {
+  let latest = new Date(bean.updatedAt || bean.createdAt || 0).getTime();
+  db.recipes.forEach((r) => {
+    if (r.beanId === beanId) {
+      const t = new Date(r.date || 0).getTime();
+      if (t > latest) latest = t;
+    }
+  });
+  db.brews.forEach((br) => {
+    if (br.beanId === beanId) {
+      const t = new Date(br.date || 0).getTime();
+      if (t > latest) latest = t;
+    }
+  });
+  return latest;
+}
+function sortBeansByRecentActivity(db, beans) {
+  return beans.slice().sort((a, b) => lastBeanActivity(db, b.id, b) - lastBeanActivity(db, a.id, a));
+}
+
 function DatabaseScreen({ db, persist, onBack, initialTab }) {
   const [tab, setTab] = useState(initialTab || "beans");
   const [formOpen, setFormOpen] = useState(false);
@@ -4692,27 +4897,6 @@ function DatabaseScreen({ db, persist, onBack, initialTab }) {
   const [importPreview, setImportPreview] = useState(null); // parsed db, menunggu konfirmasi
   const importFileRef = useRef(null);
 
-  // Aktivitas terakhir sebuah bean = yang paling baru di antara: kapan bean
-  // itu sendiri diedit/ditambah, kapan terakhir dipakai di trial Dial-In
-  // (recipes), atau kapan terakhir diseduh lewat Bikin Kopi (brews) — bukan
-  // cuma kapan data bean-nya diutak-atik.
-  const lastBeanActivity = (beanId, bean) => {
-    let latest = new Date(bean.updatedAt || bean.createdAt || 0).getTime();
-    db.recipes.forEach((r) => {
-      if (r.beanId === beanId) {
-        const t = new Date(r.date || 0).getTime();
-        if (t > latest) latest = t;
-      }
-    });
-    db.brews.forEach((br) => {
-      if (br.beanId === beanId) {
-        const t = new Date(br.date || 0).getTime();
-        if (t > latest) latest = t;
-      }
-    });
-    return latest;
-  };
-
   const rawItems = db[tab] || [];
   const items =
     tab === "recipes"
@@ -4721,8 +4905,8 @@ function DatabaseScreen({ db, persist, onBack, initialTab }) {
       ? rawItems.slice().sort((a, b) => {
           const stockDiff = (a.outOfStock ? 1 : 0) - (b.outOfStock ? 1 : 0);
           if (stockDiff !== 0) return stockDiff;
-          const aTime = lastBeanActivity(a.id, a);
-          const bTime = lastBeanActivity(b.id, b);
+          const aTime = lastBeanActivity(db, a.id, a);
+          const bTime = lastBeanActivity(db, b.id, b);
           return bTime - aTime;
         })
       : rawItems;
