@@ -2844,6 +2844,34 @@ function SelectCard({ title, subtitle, onClick, swatchColor }) {
   );
 }
 
+// Konsolidasi kalkulasi angka prediksi yang dipakai bareng di Bikin Kopi
+// dan Dial-In (dulu ke-duplikat persis di dua tempat, gampang kelewat kalau
+// ada perbaikan logika di satu tempat doang) — perbaikan kalkulasi cukup
+// dilakukan sekali di sini, otomatis kepakai di kedua layar. Tampilan/gaya
+// badge tetap diatur masing-masing screen; ini cuma nyediain angka & teksnya.
+function computePredictionDisplay(prediction, targetDose, grinder) {
+  const isExact = prediction?.type === "exact";
+  const baseDoseForAdjust = isExact ? parseFloat(prediction.recipe.dose) : null;
+  const exactBaseSetting = isExact
+    ? prediction.adjustedSetting != null
+      ? prediction.adjustedSetting
+      : parseFloat(prediction.recipe.setting)
+    : null;
+  const doseAdjusted =
+    isExact && targetDose != null ? doseAdjustSetting(exactBaseSetting, baseDoseForAdjust, targetDose, grinder) : null;
+  const displaySetting = doseAdjusted != null ? doseAdjusted : isExact ? exactBaseSetting : prediction?.setting ?? null;
+  const geserText =
+    isExact && prediction.adjustedSetting != null
+      ? `Digeser dari ${prediction.recipe.setting}${
+          prediction.adjustmentBasis
+            ? ` — dihitung dari ${prediction.adjustmentBasis.count} trial bean ini`
+            : " — estimasi 1 step (rasio/waktu belum cukup buat dihitung presisi)"
+        }`
+      : null;
+  const doseAdjustText = doseAdjusted != null ? `Setting disesuaikan dari data dose ${prediction.recipe.dose}g ke target ~${targetDose}g` : null;
+  return { exactBaseSetting, doseAdjusted, displaySetting, doseAdjustText, geserText };
+}
+
 function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
   const [step, setStep] = useState("bean"); // bean | grinder | machine | size | result | feedback | confirmSave | done
   const [beanId, setBeanId] = useState(null);
@@ -2867,17 +2895,7 @@ function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
   // kalibrasi dose→step. Bridge/rough/adjusted dilewati karena nggak ada
   // dose baseline yang jelas buat jadi patokan geser.
   const targetDose = resolveTargetDose(size, customDose);
-  const baseDoseForAdjust = prediction?.type === "exact" ? parseFloat(prediction.recipe.dose) : null;
-  const exactBaseSetting =
-    prediction?.type === "exact"
-      ? prediction.adjustedSetting != null
-        ? prediction.adjustedSetting
-        : parseFloat(prediction.recipe.setting)
-      : null;
-  const doseAdjusted =
-    prediction?.type === "exact" && targetDose != null
-      ? doseAdjustSetting(exactBaseSetting, baseDoseForAdjust, targetDose, grinder)
-      : null;
+  const { exactBaseSetting, doseAdjusted, doseAdjustText, geserText } = computePredictionDisplay(prediction, targetDose, grinder);
 
   // Kalau recipe yang lagi ditampilkan dicatat waktu inner burr grinder ini
   // masih di posisi beda dari sekarang, settingnya kemungkinan udah nggak
@@ -3160,23 +3178,20 @@ function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
                     ⚠️ Inner burr sekarang ({grinder.innerBurr}) beda dari saat data ini dicatat ({prediction.recipe.innerBurr})
                   </div>
                 )}
-                {doseAdjusted != null && (
+                {doseAdjustText && (
                   <div
                     className="inline-flex items-center gap-1.5 mt-4 rounded-full text-xs px-3 py-1.5"
                     style={{ backgroundColor: "#F5E6D8", color: "#B8763C" }}
                   >
-                    ⚖️ Setting disesuaikan dari data dose {prediction.recipe.dose}g ke target ~{targetDose}g
+                    ⚖️ {doseAdjustText}
                   </div>
                 )}
-                {doseAdjusted == null && prediction.type === "exact" && prediction.adjustedSetting != null && (
+                {!doseAdjustText && geserText && (
                   <div
                     className="inline-flex items-center gap-1.5 mt-4 rounded-full text-xs px-3 py-1.5"
                     style={{ backgroundColor: "#F5E6D8", color: "#B8763C" }}
                   >
-                    📐 Digeser dari {prediction.recipe.setting}
-                    {prediction.adjustmentBasis
-                      ? ` — dihitung dari ${prediction.adjustmentBasis.count} trial bean ini`
-                      : " — estimasi 1 step (rasio/waktu belum cukup buat dihitung presisi)"}
+                    📐 {geserText}
                   </div>
                 )}
                 {doseAdjusted == null && prediction.type === "exact" && prediction.recipe.status === "Experiment" && (
@@ -3544,17 +3559,7 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
   // Sama kayak Bikin Kopi: kalau ada recipe asli (exact) dengan dose beda
   // dari target ukuran yang dipilih, geser settingnya sebagai titik awal.
   const targetDose = resolveTargetDose(size, customDose);
-  const baseDoseForAdjust = prediction?.type === "exact" ? parseFloat(prediction.recipe.dose) : null;
-  const exactBaseSetting =
-    prediction?.type === "exact"
-      ? prediction.adjustedSetting != null
-        ? prediction.adjustedSetting
-        : parseFloat(prediction.recipe.setting)
-      : null;
-  const doseAdjusted =
-    prediction?.type === "exact" && targetDose != null
-      ? doseAdjustSetting(exactBaseSetting, baseDoseForAdjust, targetDose, grinder)
-      : null;
+  const { exactBaseSetting, doseAdjusted, doseAdjustText, geserText } = computePredictionDisplay(prediction, targetDose, grinder);
   const innerBurrMismatch =
     prediction?.type === "exact" &&
     grinder?.innerBurr &&
@@ -3831,15 +3836,7 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
                   </div>
                 </div>
                 <div className="text-xs mt-1" style={{ color: "#6B6058" }}>
-                  {doseAdjusted != null
-                    ? `Setting disesuaikan dari data dose ${prediction.recipe.dose}g ke target ~${targetDose}g`
-                    : prediction.adjustedSetting != null
-                    ? `Digeser dari ${prediction.recipe.setting}${
-                        prediction.adjustmentBasis
-                          ? ` — dihitung dari ${prediction.adjustmentBasis.count} trial bean ini`
-                          : " — estimasi 1 step (rasio/waktu belum cukup buat dihitung presisi)"
-                      }`
-                    : "Setting terbaik yang tercatat"}
+                  {doseAdjustText || geserText || "Setting terbaik yang tercatat"}
                 </div>
                 {innerBurrMismatch && (
                   <div
