@@ -442,7 +442,7 @@ function applyDeviationNudge(prediction, db, grinder) {
 // waktu-per-setting dari data bean itu sendiri jauh lebih bisa dipercaya.
 // Butuh minimal 2 titik data dengan setting BEDA biar bisa ditarik garis;
 // kalau belum cukup, balikin null (caller fallback ke estimasi flat 1 step).
-function estimateLocalTimePerStep(db, beanId, grinderId, machineId, shotType) {
+function estimateLocalTimePerStep(db, beanId, grinderId, machineId, shotType, refDose) {
   const points = db.recipes
     .filter(
       (r) =>
@@ -451,20 +451,38 @@ function estimateLocalTimePerStep(db, beanId, grinderId, machineId, shotType) {
         r.machineId === machineId &&
         (r.shotType || "Espresso") === shotType
     )
-    .map((r) => ({ x: parseFloat(r.setting), y: parseFloat(r.time) }))
+    .map((r) => ({ x: parseFloat(r.setting), y: parseFloat(r.time), dose: parseFloat(r.dose) }))
     .filter((p) => !isNaN(p.x) && !isNaN(p.y));
 
-  const distinctX = new Set(points.map((p) => p.x));
-  if (points.length < 2 || distinctX.size < 2) return null;
+  // Dose ikut ngaruh gede ke waktu ekstraksi, TERLEPAS dari setting-nya —
+  // kalau dibiarin nyampur (misal dose 18g digabung sama dose 10g dalam
+  // satu kolam data), slope waktu-per-setting bisa keitung ngasal/kebalik
+  // arah (kejadian beneran di Shaka Blend). Jadi kalau ada `refDose`,
+  // saring dulu cuma trial yang dose-nya deket (±1g) ke dose yang lagi
+  // dipakai sekarang.
+  const filtered =
+    refDose != null && !isNaN(refDose)
+      ? points.filter((p) => !isNaN(p.dose) && Math.abs(p.dose - refDose) <= 1)
+      : points;
+  const pool = refDose != null && !isNaN(refDose) ? filtered : points;
 
-  const n = points.length;
-  const meanX = points.reduce((s, p) => s + p.x, 0) / n;
-  const meanY = points.reduce((s, p) => s + p.y, 0) / n;
-  const num = points.reduce((s, p) => s + (p.x - meanX) * (p.y - meanY), 0);
-  const den = points.reduce((s, p) => s + (p.x - meanX) * (p.x - meanX), 0);
+  const distinctX = new Set(pool.map((p) => p.x));
+  if (pool.length < 2 || distinctX.size < 2) return null;
+
+  const n = pool.length;
+  const meanX = pool.reduce((s, p) => s + p.x, 0) / n;
+  const meanY = pool.reduce((s, p) => s + p.y, 0) / n;
+  const num = pool.reduce((s, p) => s + (p.x - meanX) * (p.y - meanY), 0);
+  const den = pool.reduce((s, p) => s + (p.x - meanX) * (p.x - meanX), 0);
   if (den === 0) return null;
   const secondsPerUnit = num / den; // detik per 1 unit setting, bukan per step
-  if (!isFinite(secondsPerUnit) || secondsPerUnit === 0) return null;
+  // Sanity check arah: secara fisik, setting lebih gede (lebih kasar) HARUS
+  // bikin waktu ekstraksi lebih cepat (secondsPerUnit negatif). Kalau
+  // hasilnya malah positif, itu tanda datanya masih kekontaminasi variabel
+  // lain yang nggak dikontrol (WDT, distribusi, channeling, dll) — slope-nya
+  // nggak bisa dipercaya sama sekali, mending dianggap nggak ada data
+  // daripada dipakai kebalik arah.
+  if (!isFinite(secondsPerUnit) || secondsPerUnit >= 0) return null;
   return { secondsPerUnit, count: n };
 }
 
@@ -499,7 +517,7 @@ function predictSetting(db, beanId, grinderId, machineId, shotType) {
         const range = SHOT_TIME_RANGE[exactShotType];
         let deltaSetting = null;
 
-        const local = estimateLocalTimePerStep(db, beanId, grinderId, machineId, exactShotType);
+        const local = estimateLocalTimePerStep(db, beanId, grinderId, machineId, exactShotType, parseFloat(exact.dose));
         if (local && range && !isNaN(actualTime)) {
           const targetTime = actualTime < range[0] ? range[0] : actualTime > range[1] ? range[1] : null;
           if (targetTime != null) {
@@ -2629,22 +2647,37 @@ function NudgeNote({ prediction }) {
 // dari dose/yield/time recipe (bukan disimpan terpisah), dipakai di mana
 // pun recipe ditampilkan. Kalau beda dari shotType yang dipilih user pas
 // dial-in, ditandain biar ketauan ada mismatch.
-function ShotCategoryBadge({ dose, yieldVal, time, intendedShotType }) {
+function ShotCategoryBadge({ dose, yieldVal, time, intendedShotType, setting, grinder }) {
   const result = classifyShotResult(dose, yieldVal, time);
   if (!result) return null;
   const intended = intendedShotType || "Espresso";
   const mismatch = !result.conflict && intended !== "Lainnya" && result.category !== intended;
+  const flagged = mismatch || result.conflict;
+  // Kalau ditandai bermasalah, sekalian kasih tau angka alternatif buat
+  // ngejar kategori aslinya — informasi pasif aja, bukan tombol/mode
+  // terpisah, jadi otomatis muncul di semua tempat badge ini dipakai
+  // (kartu Percobaan Terakhir, list Recipe, form edit) tanpa nambah state.
+  let altText = "";
+  if (flagged && grinder) {
+    const suggestion = suggestNextGrindShift(result, intended, grinder);
+    const base = parseFloat(setting);
+    if (suggestion && !isNaN(base)) {
+      const delta = suggestion.direction === "finer" ? -suggestion.stepDelta : suggestion.stepDelta;
+      const alt = Math.round(clampToSafeMin(roundToStep(base + delta, grinder), grinder) * 100) / 100;
+      altText = ` → coba ~${alt} kalau mau ngejar ${intended} murni`;
+    }
+  }
   return (
     <span
       className="text-[11px] rounded-full px-2 py-0.5"
       style={{
-        backgroundColor: mismatch || result.conflict ? "#FBEADD" : "#E3F5EC",
-        color: mismatch || result.conflict ? "#B8632E" : "#1F7A4C",
+        backgroundColor: flagged ? "#FBEADD" : "#E3F5EC",
+        color: flagged ? "#B8632E" : "#1F7A4C",
       }}
     >
       {result.conflict
-        ? `⚠️ Waktu mirip ${result.timeCategory}, tapi rasio (~1:${Math.round(result.ratio * 100) / 100}) mirip ${result.ratioCategory || "kategori lain"} — kemungkinan aliran nggak wajar`
-        : `Hasil: ${result.category}${mismatch ? ` (dipilih: ${intended})` : ""}`}
+        ? `⚠️ Waktu mirip ${result.timeCategory}, tapi rasio (~1:${Math.round(result.ratio * 100) / 100}) mirip ${result.ratioCategory || "kategori lain"} — kemungkinan aliran nggak wajar${altText}`
+        : `Hasil: ${result.category}${mismatch ? ` (dipilih: ${intended})` : ""}${altText}`}
     </span>
   );
 }
@@ -2697,7 +2730,14 @@ function LastTrialCard({ db, beanId, grinderId, machineId }) {
       </div>
       {details && <div className="text-sm" style={{ color: "#2A2118" }}>{details}</div>}
       <div className="mt-1">
-        <ShotCategoryBadge dose={r.dose} yieldVal={r.yield} time={r.time} intendedShotType={r.shotType} />
+        <ShotCategoryBadge
+          dose={r.dose}
+          yieldVal={r.yield}
+          time={r.time}
+          intendedShotType={r.shotType}
+          setting={r.setting}
+          grinder={db.grinders.find((g) => g.id === grinderId)}
+        />
       </div>
       {tasteLine && <div className="text-sm mt-0.5" style={{ color: "#2A2118" }}>{tasteLine}</div>}
       {fmtDate(r.date) && <div className="text-xs mt-1" style={{ color: "#736657" }}>{fmtDate(r.date)}</div>}
@@ -2753,7 +2793,14 @@ function FullTrialHistory({ db, beanId, grinderId, machineId }) {
                 </div>
                 {details && <div className="text-xs mt-0.5" style={{ color: "#6B6058" }}>{details}</div>}
                 <div className="mt-1">
-                  <ShotCategoryBadge dose={r.dose} yieldVal={r.yield} time={r.time} intendedShotType={r.shotType} />
+                  <ShotCategoryBadge
+                    dose={r.dose}
+                    yieldVal={r.yield}
+                    time={r.time}
+                    intendedShotType={r.shotType}
+                    setting={r.setting}
+                    grinder={db.grinders.find((g) => g.id === grinderId)}
+                  />
                 </div>
                 {tasteLine && <div className="text-xs mt-1" style={{ color: "#2A2118" }}>{tasteLine}</div>}
                 {r.notes && (
@@ -4496,6 +4543,8 @@ function ItemForm({ tabKey, db, initial, onCancel, onSave }) {
               yieldVal={values.yield}
               time={values.time}
               intendedShotType={values.shotType}
+              setting={values.setting}
+              grinder={db.grinders.find((g) => g.id === values.grinderId)}
             />
           )}
         </div>
@@ -4697,7 +4746,14 @@ function ShotHistoryPanel({ db, persist, onEdit }) {
                     .join(" · ")}
                 </div>
                 <div className="mt-1">
-                  <ShotCategoryBadge dose={r.dose} yieldVal={r.yield} time={r.time} intendedShotType={r.shotType} />
+                  <ShotCategoryBadge
+                    dose={r.dose}
+                    yieldVal={r.yield}
+                    time={r.time}
+                    intendedShotType={r.shotType}
+                    setting={r.setting}
+                    grinder={db.grinders.find((g) => g.id === r.grinderId)}
+                  />
                 </div>
                 {r.notes && (
                   <div
