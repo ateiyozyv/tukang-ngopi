@@ -286,7 +286,19 @@ function roundToStep(value, grinder) {
 // Breville: ADF Winey 18g → setting 4 vs (re-roast) 10g → setting 2
 //   (selisih 2 step Breville @1 untuk selisih 8g juga)
 // Keduanya = 0,25 "step grinder" per 4 gram dose → 0,0625 step per gram.
-const DOSE_STEP_PER_GRAM = 0.0625; // dalam satuan step grinder, per gram dose
+// Sensitivitas dose→setting itu beda-beda tiap grinder (burr geometry beda,
+// K64S flat 64mm vs Breville conical bawaan) — jadi nggak dipukul rata pakai
+// 1 konstanta global. Field `doseShiftPer8g` grinder diisi LANGSUNG dalam
+// satuan setting yang biasa dipakai (bukan "step" atau "per gram" yang
+// bikin bingung) — contoh: K64S diisi 0,5 artinya "buat lompatan dose 8
+// gram, geser setengah" (misal dari 3,0 ke 2,5); Breville diisi 2 artinya
+// "geser 2 angka" (misal dari 7 ke 5). Kalau belum diisi, fallback ke
+// setengah step grinder itu sendiri per lompatan 8g — tebakan kasar.
+function doseShiftPer8gFor(grinder) {
+  const step = parseFloat(grinder?.stepSize) || 1;
+  const configured = parseFloat(grinder?.doseShiftPer8g);
+  return !isNaN(configured) ? configured : 0.5 * step;
+}
 
 // Batas bawah paling halus yang masih aman buat sebuah grinder — dari
 // field "Setting minimum aman" (kalau diisi user berdasar pengalaman,
@@ -310,9 +322,8 @@ function clampToSafeMin(value, grinder) {
 function doseAdjustSetting(baseSetting, baseDose, targetDose, grinder) {
   if (baseDose == null || isNaN(baseDose) || targetDose == null || isNaN(targetDose)) return null;
   if (Math.abs(baseDose - targetDose) < 0.5) return null;
-  const step = parseFloat(grinder?.stepSize) || 1;
   const gramDiff = targetDose - baseDose;
-  const numericShift = gramDiff * DOSE_STEP_PER_GRAM * step;
+  const numericShift = (gramDiff / 8) * doseShiftPer8gFor(grinder);
   const raw = baseSetting + numericShift;
   const rounded = roundToStep(raw, grinder);
   return Math.round(clampToSafeMin(rounded, grinder) * 100) / 100;
@@ -2158,6 +2169,7 @@ function grinderToRow(g) {
     min_safe_setting: normalizeDecimal(g.minSafeSetting) || "",
     restricted_to_machine_id: g.restrictedToMachineId || null,
     exclude_as_reference: g.excludeAsReference === "Ya",
+    dose_shift_per_8g: g.doseShiftPer8g || "",
     notes: g.notes || "",
   };
 }
@@ -2172,6 +2184,7 @@ function rowToGrinder(r) {
     minSafeSetting: r.min_safe_setting,
     restrictedToMachineId: r.restricted_to_machine_id || "",
     excludeAsReference: r.exclude_as_reference ? "Ya" : "Tidak",
+    doseShiftPer8g: r.dose_shift_per_8g || "",
     notes: r.notes,
   };
 }
@@ -4333,6 +4346,7 @@ const FORM_SCHEMAS = {
     { key: "minSafeSetting", label: "Setting minimum aman (batas paling halus, biar prediksi nggak nyaranin lebih halus dari ini)", placeholder: "cth. 0.5" },
     { key: "restrictedToMachineId", label: "Khusus mesin (kosongkan kalau bisa semua)", ref: "machines" },
     { key: "excludeAsReference", label: "Jangan jadikan rujukan buat prediksi grinder lain (grinder ini tetap bisa dapat prediksinya sendiri)", options: ["Tidak", "Ya"], default: "Tidak" },
+    { key: "doseShiftPer8g", label: "Geser setting per lompatan dose 8 gram (mis. K64S: 0,5 | Breville: 2 — kosongkan buat tebakan kasar setengah step)" },
     { key: "notes", label: "Catatan", textarea: true },
   ],
   machines: [
