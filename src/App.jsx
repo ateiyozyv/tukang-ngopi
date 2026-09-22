@@ -214,7 +214,7 @@ function findLatestRecipe(db, beanId, grinderId, machineId) {
   );
 }
 
-function findBestRecipe(db, beanId, grinderId, machineId, shotType) {
+function findBestRecipe(db, beanId, grinderId, machineId, shotType, targetDose) {
   const pool = db.recipes.filter((r) => r.beanId === beanId && r.grinderId === grinderId);
   // Kalau machineId dikasih, wajib cocok persis mesinnya — jangan asal ambil
   // recipe dari mesin lain cuma karena bean+grinder-nya sama.
@@ -223,6 +223,19 @@ function findBestRecipe(db, beanId, grinderId, machineId, shotType) {
   // field ini dianggap "Espresso", biar data historis tetap kebaca).
   if (shotType) matches = matches.filter((r) => (r.shotType || "Espresso") === shotType);
   if (matches.length === 0) return null;
+  // Kalau target dose dikasih, PRIORITASKAN recipe yang dose-nya deket
+  // (±2g) — data yang beneran diukur langsung di dose yang bener lebih bisa
+  // dipercaya daripada hasil kalkulasi dose-adjust dari recipe dose lain,
+  // meskipun recipe dose lain itu kebetulan is_default/rating lebih tinggi.
+  // (Kejadian nyata: recipe 18g is_default rating 7 ngalahin recipe 10g
+  // rating 9 yang justru pas di dose yang lagi dicari.)
+  if (targetDose != null && !isNaN(targetDose)) {
+    const doseMatched = matches.filter((r) => {
+      const d = parseFloat(r.dose);
+      return !isNaN(d) && Math.abs(d - targetDose) <= 2;
+    });
+    if (doseMatched.length > 0) matches = doseMatched;
+  }
   const marked = matches.find((r) => r.isDefault);
   if (marked) return marked;
   const rated = matches.filter((r) => r.rating);
@@ -497,11 +510,11 @@ function estimateLocalTimePerStep(db, beanId, grinderId, machineId, shotType, re
   return { secondsPerUnit, count: n };
 }
 
-function predictSetting(db, beanId, grinderId, machineId, shotType) {
+function predictSetting(db, beanId, grinderId, machineId, shotType, targetDose) {
   const targetGrinder = db.grinders.find((g) => g.id === grinderId);
 
   // Tahap 0: exact match buat jenis shot ini persis.
-  const exact = findBestRecipe(db, beanId, grinderId, machineId, shotType);
+  const exact = findBestRecipe(db, beanId, grinderId, machineId, shotType, targetDose);
   if (exact) {
     // "Settled" (jangan disaranin geser) ditentuin MURNI dari rating ≥9 —
     // bener-bener enak, terlepas dari kategori shot-nya meleset atau enggak.
@@ -2900,14 +2913,16 @@ function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
   const bean = db.beans.find((b) => b.id === beanId);
   const grinder = db.grinders.find((g) => g.id === grinderId);
   const machine = db.machines.find((m) => m.id === machineId);
-  const prediction = beanId && grinderId && machineId ? predictSetting(db, beanId, grinderId, machineId) : null;
+  // targetDose dihitung duluan biar predictSetting bisa prioritasin recipe
+  // yang dose-nya emang deket ke situ (lihat catatan di findBestRecipe).
+  const targetDose = resolveTargetDose(size, customDose);
+  const prediction = beanId && grinderId && machineId ? predictSetting(db, beanId, grinderId, machineId, undefined, targetDose) : null;
   const availableBeans = sortBeansByRecentActivity(db, db.beans.filter((b) => !b.outOfStock));
 
   // Kalau prediksinya "exact" (ada recipe asli) dan dose recipe itu beda
   // dari dose target ukuran yang dipilih, geser settingnya sesuai
   // kalibrasi dose→step. Bridge/rough/adjusted dilewati karena nggak ada
   // dose baseline yang jelas buat jadi patokan geser.
-  const targetDose = resolveTargetDose(size, customDose);
   const { exactBaseSetting, doseAdjusted, doseAdjustText, geserText } = computePredictionDisplay(prediction, targetDose, grinder);
 
   // Kalau recipe yang lagi ditampilkan dicatat waktu inner burr grinder ini
@@ -3565,13 +3580,13 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
 
   const bean = db.beans.find((b) => b.id === beanId);
   const grinder = db.grinders.find((g) => g.id === grinderId);
-  const prediction = beanId && grinderId && machineId && shotType ? predictSetting(db, beanId, grinderId, machineId, shotType) : null;
+  // Sama kayak Bikin Kopi: targetDose dihitung duluan biar predictSetting
+  // bisa prioritasin recipe yang dose-nya emang deket ke situ.
+  const targetDose = resolveTargetDose(size, customDose);
+  const prediction =
+    beanId && grinderId && machineId && shotType ? predictSetting(db, beanId, grinderId, machineId, shotType, targetDose) : null;
   const availableBeans = sortBeansByRecentActivity(db, db.beans.filter((b) => !b.outOfStock));
   const shotTypeTags = bean ? suggestShotTypeTags(bean) : {};
-
-  // Sama kayak Bikin Kopi: kalau ada recipe asli (exact) dengan dose beda
-  // dari target ukuran yang dipilih, geser settingnya sebagai titik awal.
-  const targetDose = resolveTargetDose(size, customDose);
   const { exactBaseSetting, doseAdjusted, doseAdjustText, geserText } = computePredictionDisplay(prediction, targetDose, grinder);
   const innerBurrMismatch =
     prediction?.type === "exact" &&
