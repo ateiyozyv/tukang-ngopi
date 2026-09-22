@@ -518,30 +518,45 @@ function predictSetting(db, beanId, grinderId, machineId, shotType, targetDose) 
   if (exact) {
     // "Settled" (jangan disaranin geser) ditentuin MURNI dari rating ≥9 —
     // bener-bener enak, terlepas dari kategori shot-nya meleset atau enggak.
-    // `isDefault` SENGAJA tidak dipakai di sini: bean bisa berubah karakter
-    // seiring waktu (degassing dll), dan status default cuma berarti "ini
-    // yang lagi dipakai", bukan "ini kebukti masih pas sekarang". Jadi kalau
-    // hasil TERBARU yang dicatat ternyata meleset dari shot type yang
-    // diniatkan (meski recipe-nya kebetulan default), tetap disaranin
-    // geser buat percobaan berikutnya — dihitung dari slope waktu-per-step
-    // lokal bean+grinder+mesin ini kalau datanya udah cukup (≥2 trial
-    // setting beda), atau estimasi flat 1 step kalau belum.
+    // `isDefault` SENGAJA tidak dipakai buat ini — default cuma berarti
+    // "ini jawaban final buat bean+dose ini", bukan "settingnya kebukti
+    // masih pas SEKARANG" (bean bisa berubah karakter seiring waktu).
     const exactShotType = exact.shotType || "Espresso";
-    const ratingNum = exact.rating != null && exact.rating !== "" ? Number(exact.rating) : null;
+    // Buat NGECEK apakah setting ini masih valid, jangan cuma percaya
+    // snapshot data yang nempel di recipe exact match ini — kalau ada
+    // percobaan yang LEBIH BARU persis di angka setting yang sama (retest),
+    // itu yang lebih relevan (bean bisa berubah karakter seiring waktu,
+    // dan retest lebih baru = bukti paling update soal validitas angka ini
+    // SEKARANG, terlepas recipe mana yang ditandai default/exact).
+    const sameSettingRetests = db.recipes.filter(
+      (r) =>
+        r.beanId === beanId &&
+        r.grinderId === grinderId &&
+        r.machineId === machineId &&
+        (r.shotType || "Espresso") === exactShotType &&
+        parseFloat(r.setting) === parseFloat(exact.setting) &&
+        new Date(r.date || 0).getTime() > new Date(exact.date || 0).getTime()
+    );
+    const latestRetest = sameSettingRetests.length
+      ? sameSettingRetests.reduce((latest, r) => (new Date(r.date || 0) > new Date(latest.date || 0) ? r : latest))
+      : null;
+    const evalSource = latestRetest || exact;
+
+    const ratingNum = evalSource.rating != null && evalSource.rating !== "" ? Number(evalSource.rating) : null;
     const isSettled = ratingNum != null && ratingNum >= 9;
     let adjustedSetting = null;
     let adjustmentBasis = null;
     if (!isSettled) {
-      const result = classifyShotResult(exact.dose, exact.yield, exact.time);
+      const result = classifyShotResult(evalSource.dose, evalSource.yield, evalSource.time);
       const mismatch = result && !result.conflict && result.category !== "Lainnya" && result.category !== exactShotType;
       if (result && (result.conflict || mismatch)) {
         const step = parseFloat(targetGrinder?.stepSize) || 1;
         const base = parseFloat(exact.setting);
-        const actualTime = parseFloat(exact.time);
+        const actualTime = parseFloat(evalSource.time);
         const range = SHOT_TIME_RANGE[exactShotType];
         let deltaSetting = null;
 
-        const local = estimateLocalTimePerStep(db, beanId, grinderId, machineId, exactShotType, parseFloat(exact.dose));
+        const local = estimateLocalTimePerStep(db, beanId, grinderId, machineId, exactShotType, parseFloat(evalSource.dose));
         if (local && range && !isNaN(actualTime)) {
           const targetTime = actualTime < range[0] ? range[0] : actualTime > range[1] ? range[1] : null;
           if (targetTime != null) {
