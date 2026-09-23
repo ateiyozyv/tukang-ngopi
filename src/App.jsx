@@ -238,14 +238,19 @@ function findBestRecipe(db, beanId, grinderId, machineId, shotType, targetDose) 
   }
   const marked = matches.find((r) => r.isDefault);
   if (marked) return marked;
-  const rated = matches.filter((r) => r.rating);
-  if (rated.length > 0) {
-    return rated.reduce((best, r) =>
-      Number(r.rating) > Number(best.rating) ? r : best
-    );
+  // Kalau ada yang udah beneran kebukti enak (rating ≥9), itu paling bisa
+  // dipercaya sebagai "jawaban terbaik sejauh ini" — walau belum ditandai
+  // default secara eksplisit.
+  const genuinelyGood = matches.filter((r) => r.rating != null && r.rating !== "" && Number(r.rating) >= 9);
+  if (genuinelyGood.length > 0) {
+    return genuinelyGood.reduce((best, r) => (Number(r.rating) > Number(best.rating) ? r : best));
   }
-  // fallback: belum ada rating/default — pakai yang terakhir ditambahkan
-  return matches[matches.length - 1];
+  // Belum ada yang bener-bener settled — berarti proses dial-in masih
+  // jalan. Titik paling relevan buat lanjut adalah percobaan PALING BARU,
+  // BUKAN "yang kebetulan rating-nya sedikit lebih tinggi" dari eksplorasi
+  // lama (itu bikin dial-in muter di tempat, ngabaiin retry-retry terbaru
+  // yang justru lebih tau kondisi bean SEKARANG).
+  return matches.slice().sort((a, b) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime())[0];
 }
 
 // Perkiraan geser step grinder per jenis shot, relatif ke setting Espresso
