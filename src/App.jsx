@@ -3573,6 +3573,17 @@ function suggestNextGrindShift(result, targetShotType, grinder) {
     if (result.ratio > ratioRange[1]) return { direction: "finer", stepDelta: step };
     if (result.ratio < ratioRange[0]) return { direction: "coarser", stepDelta: step };
   }
+  // Fungsi ini CUMA pernah dipanggil kalau hasilnya udah ketauan bermasalah
+  // (conflict/mismatch) dari pengecekan sebelumnya, jadi nggak perlu lagi
+  // syarat "harus jelas ngelewatin batas" di sini — itu tugas pengecekan
+  // sebelumnya. Kalau waktu & rasio kebetulan dua-duanya masih di DALAM
+  // rentang (cuma nyerempet ke pinggir — kejadian umum pas conflict: waktu
+  // di ujung satu kategori, rasio di ujung kategori lain), pakai jarak ke
+  // TITIK TENGAH rentang waktu sebagai tie-breaker, biar tetap dapet arah.
+  if (timeRange && !isNaN(t)) {
+    const mid = (timeRange[0] + timeRange[1]) / 2;
+    if (t !== mid) return { direction: t < mid ? "finer" : "coarser", stepDelta: step };
+  }
   return null;
 }
 
