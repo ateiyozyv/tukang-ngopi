@@ -214,8 +214,74 @@ function findLatestRecipe(db, beanId, grinderId, machineId) {
   );
 }
 
-function findBestRecipe(db, beanId, grinderId, machineId, shotType, targetDose) {
-  const pool = db.recipes.filter((r) => r.beanId === beanId && r.grinderId === grinderId);
+// Inner burr (Breville): hasil giling di setting luar yang sama BEDA total
+// kalau inner burr-nya beda, jadi data hanya dianggap cocok kalau inner burr
+// saat dicatat sama dengan inner burr grinder SEKARANG. Resep tanpa catatan
+// inner burr (data lama/grinder tanpa inner burr) dianggap cocok.
+function burrKey(v) {
+  return v == null ? "" : String(v).trim();
+}
+function recipeMatchesBurr(r, burr) {
+  if (!burr) return true;
+  const rb = burrKey(r.innerBurr);
+  return rb === "" || rb === burr;
+}
+
+// Kalau grinder punya inner burr, tiap 1 langkah inner butuh geser setting
+// luar sebesar ini (lebih halus/angka inner lebih kecil → setting luar naik).
+// Angka awal dari ingatan pemakai (inner 6→4 ≈ setting luar 1→10 ≈ 4,5 per
+// langkah); begitu ada pasangan data bersih di dua inner burr, dihitung dari
+// data sendiri.
+const DEFAULT_BURR_SHIFT = 4.5;
+
+function learnedBurrShift(db, grinder) {
+  const cur = burrKey(grinder?.innerBurr);
+  const curNum = parseFloat(cur);
+  if (!cur || isNaN(curNum)) return null;
+  const otherBurrs = [
+    ...new Set(
+      db.recipes
+        .filter((r) => r.grinderId === grinder.id && burrKey(r.innerBurr) !== "" && burrKey(r.innerBurr) !== cur)
+        .map((r) => burrKey(r.innerBurr))
+    ),
+  ];
+  const values = [];
+  const dbCur = { ...db, recipes: db.recipes.filter((r) => burrKey(r.innerBurr) === cur) };
+  otherBurrs.forEach((ob) => {
+    const obNum = parseFloat(ob);
+    if (isNaN(obNum)) return;
+    const dbOld = { ...db, recipes: db.recipes.filter((r) => burrKey(r.innerBurr) === ob) };
+    db.beans.forEach((bean) => {
+      const rOld = findBestRecipe(dbOld, bean.id, grinder.id);
+      const rNew = findBestRecipe(dbCur, bean.id, grinder.id);
+      if (!rOld || !rNew) return;
+      const good = (r) => r.isDefault || (r.rating != null && r.rating !== "" && Number(r.rating) >= 9);
+      if (!good(rOld) || !good(rNew)) return;
+      if ((rOld.shotType || "Espresso") !== (rNew.shotType || "Espresso")) return;
+      const dOld = parseFloat(rOld.dose);
+      const dNew = parseFloat(rNew.dose);
+      if (isNaN(dOld) || isNaN(dNew) || Math.abs(dOld - dNew) > 2) return;
+      const sOld = parseFloat(rOld.setting);
+      const sNew = parseFloat(rNew.setting);
+      if (isNaN(sOld) || isNaN(sNew)) return;
+      const v = (sNew - sOld) / (obNum - curNum);
+      if (isFinite(v) && v > 0) values.push(v);
+    });
+  });
+  if (values.length === 0) return null;
+  return { value: values.reduce((a, b) => a + b, 0) / values.length, count: values.length };
+}
+
+function burrShiftPerStep(db, grinder) {
+  const learned = learnedBurrShift(db, grinder);
+  if (learned) return { value: learned.value, learned: true, count: learned.count };
+  const cfg = parseFloat(grinder?.innerBurrShift);
+  return { value: !isNaN(cfg) && cfg > 0 ? cfg : DEFAULT_BURR_SHIFT, learned: false, count: 0 };
+}
+
+function findBestRecipe(db, beanId, grinderId, machineId, shotType, targetDose, burr) {
+  let pool = db.recipes.filter((r) => r.beanId === beanId && r.grinderId === grinderId);
+  if (burr) pool = pool.filter((r) => recipeMatchesBurr(r, burr));
   // Kalau machineId dikasih, wajib cocok persis mesinnya — jangan asal ambil
   // recipe dari mesin lain cuma karena bean+grinder-nya sama.
   let matches = machineId ? pool.filter((r) => r.machineId === machineId) : pool;
@@ -267,9 +333,11 @@ const SHOT_TYPE_STEP_OFFSET = {
 // yang kebetulan sudah punya recipe terbaik di KEDUA grinder itu ("bridge").
 function findBridgeRatio(db, grinderAId, grinderBId) {
   const ratios = [];
+  const burrA = burrKey(db.grinders.find((g) => g.id === grinderAId)?.innerBurr);
+  const burrB = burrKey(db.grinders.find((g) => g.id === grinderBId)?.innerBurr);
   db.beans.forEach((bean) => {
-    const rA = findBestRecipe(db, bean.id, grinderAId);
-    const rB = findBestRecipe(db, bean.id, grinderBId);
+    const rA = findBestRecipe(db, bean.id, grinderAId, undefined, undefined, undefined, burrA);
+    const rB = findBestRecipe(db, bean.id, grinderBId, undefined, undefined, undefined, burrB);
     if (rA && rB) {
       const a = parseFloat(rA.setting);
       const b = parseFloat(rB.setting);
@@ -329,9 +397,13 @@ function safeMinSetting(grinder) {
   return !isNaN(configured) ? configured : step;
 }
 
+// Batas halus aman (min) dan, kalau diisi, batas kasar maksimum dial (max).
 function clampToSafeMin(value, grinder) {
   const min = safeMinSetting(grinder);
-  return value < min ? min : value;
+  const max = parseFloat(grinder?.maxSetting);
+  let v = value < min ? min : value;
+  if (!isNaN(max) && v > max) v = max;
+  return v;
 }
 
 // Geser setting berdasarkan selisih dose dari dose asal recipe (baseDose)
@@ -519,7 +591,8 @@ function predictSetting(db, beanId, grinderId, machineId, shotType, targetDose) 
   const targetGrinder = db.grinders.find((g) => g.id === grinderId);
 
   // Tahap 0: exact match buat jenis shot ini persis.
-  const exact = findBestRecipe(db, beanId, grinderId, machineId, shotType, targetDose);
+  const curBurr = burrKey(targetGrinder?.innerBurr);
+  const exact = findBestRecipe(db, beanId, grinderId, machineId, shotType, targetDose, curBurr);
   if (exact) {
     // "Settled" (jangan disaranin geser) ditentuin MURNI dari rating ≥9 —
     // bener-bener enak, terlepas dari kategori shot-nya meleset atau enggak.
@@ -591,10 +664,37 @@ function predictSetting(db, beanId, grinderId, machineId, shotType, targetDose) 
       : { type: "exact", recipe: exact };
   }
 
+  // Tahap 0.25: nggak ada data di inner burr SEKARANG, tapi bean ini pernah
+  // dicatat di inner burr lain di grinder yang sama — geser setting luar
+  // sesuai selisih inner burr (dikalibrasi dari data, atau angka awal).
+  if (curBurr) {
+    const other = findBestRecipe(db, beanId, grinderId, machineId, shotType, targetDose);
+    const rb = parseFloat(other?.innerBurr);
+    const cb = parseFloat(curBurr);
+    const baseS = parseFloat(other?.setting);
+    if (other && !isNaN(rb) && !isNaN(cb) && rb !== cb && !isNaN(baseS)) {
+      const sh = burrShiftPerStep(db, targetGrinder);
+      const shifted = roundToStep(baseS + sh.value * (rb - cb), targetGrinder);
+      const dosed = doseAdjustSetting(shifted, parseFloat(other.dose), targetDose, targetGrinder);
+      const finalS = dosed != null ? dosed : shifted;
+      return {
+        type: "burrshift",
+        setting: Math.round(clampToSafeMin(finalS, targetGrinder) * 100) / 100,
+        recipe: other,
+        fromBurr: burrKey(other.innerBurr),
+        toBurr: curBurr,
+        fromSetting: other.setting,
+        shiftPerStep: Math.round(sh.value * 100) / 100,
+        shiftLearned: sh.learned,
+        shiftCount: sh.count,
+      };
+    }
+  }
+
   // Tahap 0.5: belum ada data buat jenis shot ini, tapi ada resep Espresso
   // biasa buat kombinasi yang sama — geser settingnya sesuai jenis shot.
   if (shotType && shotType !== "Espresso") {
-    const base = findBestRecipe(db, beanId, grinderId, machineId, "Espresso");
+    const base = findBestRecipe(db, beanId, grinderId, machineId, "Espresso", undefined, curBurr);
     const offset = SHOT_TYPE_STEP_OFFSET[shotType] || 0;
     if (base && offset !== 0) {
       const baseSetting = parseFloat(base.setting);
@@ -633,7 +733,7 @@ function predictSetting(db, beanId, grinderId, machineId, shotType, targetDose) 
     // mem-bridge/nebak setting grinder LAIN.
     const sourceGrinder = db.grinders.find((g) => g.id === otherGrinderId);
     if (sourceGrinder?.excludeAsReference === "Ya") continue;
-    const r = findBestRecipe(db, beanId, otherGrinderId);
+    const r = findBestRecipe(db, beanId, otherGrinderId, undefined, undefined, undefined, burrKey(sourceGrinder?.innerBurr));
     if (!r) continue;
     const bridge = findBridgeRatio(db, r.grinderId, grinderId);
     if (bridge) {
@@ -660,7 +760,7 @@ function predictSetting(db, beanId, grinderId, machineId, shotType, targetDose) 
   // Tahap 3 (belum tervalidasi): tebakan kasar dari bean lain yang density-nya
   // paling dekat DAN sudah punya recipe di grinder ini. Nearest-neighbor
   // sederhana, bukan rumus — makanya selalu ditandai jujur sebagai "tebakan".
-  const rough = guessSettingRough(db, beanId, grinderId, targetGrinder);
+  const rough = guessSettingRough(db, beanId, grinderId, targetGrinder, targetDose);
   if (rough) return applyDeviationNudge(rough, db, targetGrinder);
 
   return null;
@@ -695,20 +795,42 @@ function isPlausibleDensity(v) {
   return !isNaN(v) && v >= DENSITY_MIN && v <= DENSITY_MAX;
 }
 
-function guessSettingRough(db, beanId, grinderId, targetGrinder) {
+function guessSettingRough(db, beanId, grinderId, targetGrinder, targetDose) {
   const target = db.beans.find((b) => b.id === beanId);
   const targetDensity = parseFloat(target?.density);
   if (!target || !isPlausibleDensity(targetDensity)) return null;
+
+  const curBurr = burrKey(targetGrinder?.innerBurr);
+  const curBurrNum = parseFloat(curBurr);
+  const shiftInfo = curBurr ? burrShiftPerStep(db, targetGrinder) : null;
+  const step = parseFloat(targetGrinder?.stepSize) || 1;
 
   const candidates = db.beans
     .filter((b) => b.id !== beanId)
     .map((b) => {
       const density = parseFloat(b.density);
       if (!isPlausibleDensity(density)) return null;
-      const recipe = findBestRecipe(db, b.id, grinderId);
+      // Utamakan data di inner burr yang sama; kalau bean itu cuma punya data
+      // di inner burr lain, setting-nya digeser sesuai selisih inner burr.
+      let recipe = findBestRecipe(db, b.id, grinderId, undefined, undefined, targetDose, curBurr);
+      let crossBurr = false;
+      if (!recipe && curBurr) {
+        recipe = findBestRecipe(db, b.id, grinderId, undefined, undefined, targetDose);
+        crossBurr = !!recipe;
+      }
       if (!recipe) return null;
-      const settingNum = parseFloat(recipe.setting);
+      let settingNum = parseFloat(recipe.setting);
       if (isNaN(settingNum)) return null;
+      if (crossBurr) {
+        const rb = parseFloat(recipe.innerBurr);
+        if (isNaN(rb) || isNaN(curBurrNum)) return null;
+        settingNum += shiftInfo.value * (rb - curBurrNum);
+      }
+      // Samakan dose resep pembanding ke dose target (kalau beda).
+      const rd = parseFloat(recipe.dose);
+      if (targetDose != null && !isNaN(targetDose) && !isNaN(rd) && Math.abs(rd - targetDose) >= 0.5) {
+        settingNum += ((targetDose - rd) / 8) * doseShiftPer8gFor(targetGrinder);
+      }
       // Bean yang udah habis DAN recipe-nya belum "settled" (belum default,
       // rating belum ≥9) jangan dijadiin acuan buat nebak bean lain — data
       // itu cuma tebakan sekali coba yang udah nggak bisa dites ulang lagi
@@ -718,7 +840,7 @@ function guessSettingRough(db, beanId, grinderId, targetGrinder) {
       const ratingNum = recipe.rating != null && recipe.rating !== "" ? Number(recipe.rating) : null;
       const settled = recipe.isDefault || (ratingNum != null && ratingNum >= 9);
       if (b.outOfStock && !settled) return null;
-      return { bean: b, density, recipe, settingNum };
+      return { bean: b, density, recipe, settingNum, crossBurr };
     })
     .filter(Boolean);
 
@@ -726,28 +848,46 @@ function guessSettingRough(db, beanId, grinderId, targetGrinder) {
 
   const targetRoastVal = roastValueOf(target);
 
-  // Murni kedekatan density — roast SAMA SEKALI nggak dipakai buat milih
-  // bean pembanding, walau lagi seri. Density dianggap sinyal paling
-  // dipercaya buat nyari bean paling mirip; roast cuma dipakai belakangan
-  // sebagai catatan tambahan (lihat roughRoastSuggestion di bawah), bukan
-  // buat nentuin siapa yang menang di tahap ini.
-  candidates.sort((a, b) => Math.abs(a.density - targetDensity) - Math.abs(b.density - targetDensity));
+  // Bean pembanding terdekat (murni density) — tetap dipakai sebagai
+  // referensi tampilan dan fallback kalau data belum cukup buat garis tren.
+  const byDensity = candidates.slice().sort((a, b) => Math.abs(a.density - targetDensity) - Math.abs(b.density - targetDensity));
+  const nearest = byDensity[0];
 
-  const nearest = candidates[0];
-  // Kalibrasi dari pengalaman pemakaian: tebakan kasar biasanya kegedean
-  // (terlalu kasar) 1 step, jadi digeser -1 step ke arah lebih halus
-  // sebelum dibulatkan ke step grinder yang valid.
-  const step = parseFloat(targetGrinder?.stepSize) || 1;
-  const densityAdjusted = nearest.settingNum - step;
-  const roundedMain = roundToStep(densityAdjusted, targetGrinder);
+  // Garis tren density→setting dari SEMUA bean pembanding (least squares).
+  // Di data nyata ini meleset rata-rata ±1,2 step, lebih baik daripada
+  // meniru satu bean terdekat saja (±1,8 step). Butuh ≥4 bean dengan density
+  // cukup beragam, dan kemiringan harus negatif (density makin tinggi →
+  // makin halus); kalau tidak, balik ke cara bean terdekat.
+  let mainRaw = null;
+  let method = "nearest";
+  if (candidates.length >= 4) {
+    const n = candidates.length;
+    const mx = candidates.reduce((sum, c) => sum + c.density, 0) / n;
+    const my = candidates.reduce((sum, c) => sum + c.settingNum, 0) / n;
+    const den = candidates.reduce((sum, c) => sum + (c.density - mx) * (c.density - mx), 0);
+    const num = candidates.reduce((sum, c) => sum + (c.density - mx) * (c.settingNum - my), 0);
+    const spread = Math.max(...candidates.map((c) => c.density)) - Math.min(...candidates.map((c) => c.density));
+    if (den > 0 && spread >= 0.02 && num / den < 0) {
+      const slope = num / den;
+      const raw = my + slope * (targetDensity - mx);
+      const lo = Math.min(...candidates.map((c) => c.settingNum));
+      const hi = Math.max(...candidates.map((c) => c.settingNum));
+      mainRaw = Math.min(hi, Math.max(lo, raw));
+      method = "regression";
+    }
+  }
+  if (mainRaw == null) {
+    // Kalibrasi dari pengalaman pemakaian: tebakan dari satu bean terdekat
+    // biasanya kegedean 1 step, jadi digeser -1 step ke arah lebih halus.
+    mainRaw = nearest.settingNum - step;
+  }
+  const roundedMain = roundToStep(mainRaw, targetGrinder);
   const mainSetting = Math.round(clampToSafeMin(roundedMain, targetGrinder) * 100) / 100;
 
   // Koreksi berdasarkan selisih roast — SEKARANG CUMA JADI SARAN TAMBAHAN
   // (roughRoastSuggestion), BUKAN otomatis masuk ke angka utama. Baru
-  // ditopang 2 pasangan data historis, dan ada dugaan salah satunya
-  // kena masalah roasting nggak merata — jadi nggak dipaksa jadi bagian
-  // dari angka yang ditampilin gede, biar user yang mutusin mau pakai
-  // pertimbangan ini atau enggak.
+  // ditopang data sedikit, dan efek roast belum terbukti kuat — jadi nggak
+  // dipaksa jadi bagian dari angka yang ditampilin gede.
   const ROAST_LEVEL_STEP_SHIFT = 1.0; // per 25 poin roastColor (~1 level), dalam satuan step grinder
   const nearestRoastVal = roastValueOf(nearest.bean);
   let roastAdjustment = 0;
@@ -755,12 +895,15 @@ function guessSettingRough(db, beanId, grinderId, targetGrinder) {
     const roastDiff = targetRoastVal - nearestRoastVal; // positif = target lebih gelap dari basis
     roastAdjustment = (roastDiff / 25) * ROAST_LEVEL_STEP_SHIFT * step;
   }
-  const roastRounded = roundToStep(densityAdjusted + roastAdjustment, targetGrinder);
+  const roastRounded = roundToStep(mainRaw + roastAdjustment, targetGrinder);
   const roastSuggestedSetting = Math.round(clampToSafeMin(roastRounded, targetGrinder) * 100) / 100;
 
   return {
     type: "rough",
     setting: mainSetting,
+    method,
+    regressionCount: candidates.length,
+    usedCrossBurr: candidates.some((c) => c.crossBurr),
     basedOnBeanName: nearest.bean.name,
     basedOnDensity: nearest.density,
     basedOnRoast: nearest.bean.roast || null,
@@ -2203,6 +2346,8 @@ function grinderToRow(g) {
     restricted_to_machine_id: g.restrictedToMachineId || null,
     exclude_as_reference: g.excludeAsReference === "Ya",
     dose_shift_per_8g: g.doseShiftPer8g || "",
+    inner_burr_shift: normalizeDecimal(g.innerBurrShift) || "",
+    max_setting: normalizeDecimal(g.maxSetting) || "",
     notes: g.notes || "",
   };
 }
@@ -2218,6 +2363,8 @@ function rowToGrinder(r) {
     restrictedToMachineId: r.restricted_to_machine_id || "",
     excludeAsReference: r.exclude_as_reference ? "Ya" : "Tidak",
     doseShiftPer8g: r.dose_shift_per_8g || "",
+    innerBurrShift: r.inner_burr_shift || "",
+    maxSetting: r.max_setting || "",
     notes: r.notes,
   };
 }
@@ -2678,6 +2825,31 @@ function CustomSelect({ value, onChange, options, placeholder = "Pilih…" }) {
 // plus garis lekuk di tengah, diisi warna solid sesuai roast color-nya.
 // Nempel di bawah badge prediksi (bridge/rough/adjusted) kalau angkanya
 // udah dikoreksi otomatis dari histori simpangan saran vs pemakaian nyata.
+function BurrShiftNote({ prediction }) {
+  if (!prediction || prediction.type !== "burrshift") return null;
+  return (
+    <div className="text-[11px] mt-2" style={{ color: "#736657" }}>
+      Data lama dicatat di inner burr {prediction.fromBurr} (setting {prediction.fromSetting}), sekarang inner burr {prediction.toBurr}. Digeser ±{prediction.shiftPerStep} setting per langkah inner burr
+      {prediction.shiftLearned
+        ? ` — dihitung dari ${prediction.shiftCount} pasang data kamu sendiri`
+        : " — angka awal perkiraan, belum dikalibrasi dari data"}
+      .
+    </div>
+  );
+}
+
+function RoughBasisNote({ prediction }) {
+  if (!prediction || prediction.type !== "rough") return null;
+  return (
+    <>
+      {prediction.method === "regression"
+        ? `Berdasarkan tren density dari ${prediction.regressionCount} bean lain (paling mirip: ${prediction.basedOnBeanName}, d=${Math.round(prediction.basedOnDensity * 100)})`
+        : `Berdasarkan density terdekat: ${prediction.basedOnBeanName} (d=${Math.round(prediction.basedOnDensity * 100)})`}
+      {prediction.usedCrossBurr ? " · sebagian data digeser dari inner burr lain" : ""}
+    </>
+  );
+}
+
 function NudgeNote({ prediction }) {
   if (!prediction?.nudgeApplied) return null;
   const amt = prediction.nudgeApplied;
@@ -3272,6 +3444,17 @@ function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
                     <NudgeNote prediction={prediction} />
                   </>
                 )}
+                {prediction.type === "burrshift" && (
+                  <>
+                    <div
+                      className="inline-flex items-center gap-1.5 mt-4 rounded-full text-xs px-3 py-1.5"
+                      style={{ backgroundColor: "#FBEADD", color: "#B8632E" }}
+                    >
+                      🔩 Perkiraan — inner burr sudah berubah
+                    </div>
+                    <BurrShiftNote prediction={prediction} />
+                  </>
+                )}
                 {prediction.type === "rough" && (
                   <>
                     <div
@@ -3281,7 +3464,7 @@ function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
                       🧪 Tebakan kasar — belum tervalidasi
                     </div>
                     <div className="text-[11px] mt-2" style={{ color: "#736657" }}>
-                      Berdasarkan density terdekat: {prediction.basedOnBeanName} (d={Math.round(prediction.basedOnDensity * 100)}) · bukan hasil seduhan langsung
+                      <RoughBasisNote prediction={prediction} /> · bukan hasil seduhan langsung
                     </div>
                     {prediction.roughRoastSuggestion != null && (
                       <div className="text-[11px] mt-1" style={{ color: "#B8763C" }}>
@@ -3953,6 +4136,25 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
                 </div>
                 <NudgeNote prediction={prediction} />
               </>
+            ) : prediction?.type === "burrshift" ? (
+              <>
+                <div className="flex items-center justify-center gap-3 mt-3">
+                  {bean?.roastColor !== undefined && bean?.roastColor !== "" && (
+                    <CoffeeBeanIcon size={40} color={roastColorFromValue(bean.roastColor)} />
+                  )}
+                  <div className="text-6xl" style={{ fontFamily: "'IBM Plex Mono', monospace", fontWeight: 600, color: "#2A2118" }}>
+                    {prediction.setting}
+                  </div>
+                </div>
+                <div className="text-xs mt-1" style={{ color: "#6B6058" }}>Titik awal untuk inner burr {prediction.toBurr}</div>
+                <div
+                  className="inline-flex items-center gap-1.5 mt-4 rounded-full text-xs px-3 py-1.5"
+                  style={{ backgroundColor: "#FBEADD", color: "#B8632E" }}
+                >
+                  🔩 Perkiraan — inner burr sudah berubah
+                </div>
+                <BurrShiftNote prediction={prediction} />
+              </>
             ) : prediction?.type === "rough" ? (
               <>
                 <div className="flex items-center justify-center gap-3 mt-3">
@@ -3971,7 +4173,7 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
                   🧪 Tebakan kasar — belum tervalidasi
                 </div>
                 <div className="text-[11px] mt-2" style={{ color: "#736657" }}>
-                  Berdasarkan density terdekat: {prediction.basedOnBeanName} (d={Math.round(prediction.basedOnDensity * 100)})
+                  <RoughBasisNote prediction={prediction} />
                 </div>
                 {prediction.roughRoastSuggestion != null && (
                   <div className="text-[11px] mt-1" style={{ color: "#B8763C" }}>
@@ -4001,7 +4203,7 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
           <button
             onClick={() => {
               if (prediction?.type === "exact") setShotField("setting", doseAdjusted != null ? String(doseAdjusted) : String(exactBaseSetting));
-              else if (prediction?.type === "bridge" || prediction?.type === "rough" || prediction?.type === "adjusted") setShotField("setting", String(prediction.setting));
+              else if (prediction?.type === "bridge" || prediction?.type === "rough" || prediction?.type === "adjusted" || prediction?.type === "burrshift") setShotField("setting", String(prediction.setting));
               if (targetDose != null) setShotField("dose", String(targetDose));
               setStep("shot");
             }}
@@ -4393,6 +4595,8 @@ const FORM_SCHEMAS = {
     { key: "restrictedToMachineId", label: "Khusus mesin (kosongkan kalau bisa semua)", ref: "machines" },
     { key: "excludeAsReference", label: "Jangan jadikan rujukan buat prediksi grinder lain (grinder ini tetap bisa dapat prediksinya sendiri)", options: ["Tidak", "Ya"], default: "Tidak" },
     { key: "doseShiftPer8g", label: "Geser setting per lompatan dose 8 gram (mis. K64S: 0,5 | Breville: 2 — kosongkan buat tebakan kasar setengah step)" },
+    { key: "innerBurrShift", label: "Geser setting luar per 1 langkah inner burr (angka awal, mis. Breville: 4,5 — otomatis dikoreksi dari data begitu ada pasangan data di dua inner burr)", placeholder: "cth. 4.5" },
+    { key: "maxSetting", label: "Setting maksimum dial (batas paling kasar, mis. Breville Impress: 25)", placeholder: "cth. 25" },
     { key: "notes", label: "Catatan", textarea: true },
   ],
   machines: [
