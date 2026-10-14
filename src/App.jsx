@@ -232,7 +232,9 @@ function recipeMatchesBurr(r, burr) {
 // Angka awal dari ingatan pemakai (inner 6→4 ≈ setting luar 1→10 ≈ 4,5 per
 // langkah); begitu ada pasangan data bersih di dua inner burr, dihitung dari
 // data sendiri.
-const DEFAULT_BURR_SHIFT = 4.5;
+const DEFAULT_BURR_SHIFT = 4;
+// Bobot angka awal saat dicampur dengan hasil belajar: setara 2 pasang data.
+const BURR_SHIFT_PRIOR_WEIGHT = 2;
 
 function learnedBurrShift(db, grinder) {
   const cur = burrKey(grinder?.innerBurr);
@@ -265,18 +267,22 @@ function learnedBurrShift(db, grinder) {
       const sNew = parseFloat(rNew.setting);
       if (isNaN(sOld) || isNaN(sNew)) return;
       const v = (sNew - sOld) / (obNum - curNum);
-      if (isFinite(v) && v > 0) values.push(v);
+      if (isFinite(v) && v >= 0) values.push(v);
     });
   });
   if (values.length === 0) return null;
-  return { value: values.reduce((a, b) => a + b, 0) / values.length, count: values.length };
+  return { sum: values.reduce((a, b) => a + b, 0), count: values.length };
 }
 
 function burrShiftPerStep(db, grinder) {
-  const learned = learnedBurrShift(db, grinder);
-  if (learned) return { value: learned.value, learned: true, count: learned.count };
   const cfg = parseFloat(grinder?.innerBurrShift);
-  return { value: !isNaN(cfg) && cfg > 0 ? cfg : DEFAULT_BURR_SHIFT, learned: false, count: 0 };
+  const prior = !isNaN(cfg) && cfg > 0 ? cfg : DEFAULT_BURR_SHIFT;
+  const learned = learnedBurrShift(db, grinder);
+  if (!learned) return { value: prior, learned: false, count: 0 };
+  // Dicampur dengan angka awal (bukan ditimpa) supaya satu-dua pasang data
+  // yang kacau (mis. bean lama) nggak langsung menentukan semuanya.
+  const value = (prior * BURR_SHIFT_PRIOR_WEIGHT + learned.sum) / (BURR_SHIFT_PRIOR_WEIGHT + learned.count);
+  return { value, learned: true, count: learned.count };
 }
 
 function findBestRecipe(db, beanId, grinderId, machineId, shotType, targetDose, burr) {
@@ -543,10 +549,14 @@ function applyDeviationNudge(prediction, db, grinder) {
 // waktu-per-setting dari data bean itu sendiri jauh lebih bisa dipercaya.
 // Butuh minimal 2 titik data dengan setting BEDA biar bisa ditarik garis;
 // kalau belum cukup, balikin null (caller fallback ke estimasi flat 1 step).
-function estimateLocalTimePerStep(db, beanId, grinderId, machineId, shotType, refDose) {
+function estimateLocalTimePerStep(db, beanId, grinderId, machineId, shotType, refDose, burr) {
+  // Setting luar di inner burr berbeda TIDAK setara — jangan dicampur dalam
+  // satu garis tren (kalau dicampur, kemiringannya jadi landai palsu dan
+  // saran geser meleset jauh).
   const points = db.recipes
     .filter(
       (r) =>
+        recipeMatchesBurr(r, burr) &&
         r.beanId === beanId &&
         r.grinderId === grinderId &&
         r.machineId === machineId &&
@@ -585,6 +595,42 @@ function estimateLocalTimePerStep(db, beanId, grinderId, machineId, shotType, re
   // daripada dipakai kebalik arah.
   if (!isFinite(secondsPerUnit) || secondsPerUnit >= 0) return null;
   return { secondsPerUnit, count: n };
+}
+
+// SATU-SATUNYA tempat yang menghitung "geser berapa" setelah sebuah hasil
+// meleset dari target shot — dipakai kartu prediksi DAN badge saran di
+// "Percobaan Terakhir"/riwayat, supaya angkanya selalu sama. Pertama coba
+// tren waktu lokal (bean+grinder+mesin+jenis shot+dose+inner burr yang
+// sama); kalau belum cukup data, jatuh ke estimasi 1 step.
+function computeGrindDelta(db, recipe, targetShotType, grinder, result) {
+  if (!result || !recipe || !grinder) return null;
+  const step = parseFloat(grinder?.stepSize) || 1;
+  const actualTime = parseFloat(recipe.time);
+  const range = SHOT_TIME_RANGE[targetShotType];
+  const burr = burrKey(recipe.innerBurr) || burrKey(grinder.innerBurr);
+  let delta = null;
+  let basis = null;
+
+  const local = estimateLocalTimePerStep(
+    db, recipe.beanId, recipe.grinderId, recipe.machineId, targetShotType, parseFloat(recipe.dose), burr
+  );
+  if (local && range && !isNaN(actualTime)) {
+    const targetTime = actualTime < range[0] ? range[0] : actualTime > range[1] ? range[1] : null;
+    if (targetTime != null) {
+      const rawDelta = (targetTime - actualTime) / local.secondsPerUnit;
+      // Sanity cap: kalau slope-nya kebetulan nyaris flat dan hasilnya minta
+      // geser >8 step sekaligus, itu nggak masuk akal — balik ke flat.
+      if (isFinite(rawDelta) && Math.abs(rawDelta) / step <= 8) {
+        delta = rawDelta;
+        basis = { count: local.count };
+      }
+    }
+  }
+  if (delta == null) {
+    const suggestion = suggestNextGrindShift(result, targetShotType, grinder);
+    if (suggestion) delta = suggestion.direction === "finer" ? -suggestion.stepDelta : suggestion.stepDelta;
+  }
+  return delta == null ? null : { delta, basis };
 }
 
 function predictSetting(db, beanId, grinderId, machineId, shotType, targetDose) {
@@ -628,34 +674,11 @@ function predictSetting(db, beanId, grinderId, machineId, shotType, targetDose) 
       const result = classifyShotResult(evalSource.dose, evalSource.yield, evalSource.time);
       const mismatch = result && !result.conflict && result.category !== "Lainnya" && result.category !== exactShotType;
       if (result && (result.conflict || mismatch)) {
-        const step = parseFloat(targetGrinder?.stepSize) || 1;
         const base = parseFloat(exact.setting);
-        const actualTime = parseFloat(evalSource.time);
-        const range = SHOT_TIME_RANGE[exactShotType];
-        let deltaSetting = null;
-
-        const local = estimateLocalTimePerStep(db, beanId, grinderId, machineId, exactShotType, parseFloat(evalSource.dose));
-        if (local && range && !isNaN(actualTime)) {
-          const targetTime = actualTime < range[0] ? range[0] : actualTime > range[1] ? range[1] : null;
-          if (targetTime != null) {
-            const rawDelta = (targetTime - actualTime) / local.secondsPerUnit;
-            // Sanity cap: kalau slope-nya kebetulan nyaris flat dan
-            // hasilnya minta geser >8 step sekaligus dalam satu lompatan,
-            // itu udah nggak masuk akal — jangan dipakai, balik ke flat.
-            if (isFinite(rawDelta) && Math.abs(rawDelta) / step <= 8) {
-              deltaSetting = rawDelta;
-              adjustmentBasis = { count: local.count };
-            }
-          }
-        }
-
-        if (deltaSetting == null) {
-          const suggestion = suggestNextGrindShift(result, exactShotType, targetGrinder);
-          if (suggestion) deltaSetting = suggestion.direction === "finer" ? -suggestion.stepDelta : suggestion.stepDelta;
-        }
-
-        if (deltaSetting != null && !isNaN(base)) {
-          adjustedSetting = Math.round(clampToSafeMin(roundToStep(base + deltaSetting, targetGrinder), targetGrinder) * 100) / 100;
+        const g = computeGrindDelta(db, evalSource, exactShotType, targetGrinder, result);
+        if (g && !isNaN(base)) {
+          adjustedSetting = Math.round(clampToSafeMin(roundToStep(base + g.delta, targetGrinder), targetGrinder) * 100) / 100;
+          adjustmentBasis = g.basis;
         }
       }
     }
@@ -2865,7 +2888,7 @@ function NudgeNote({ prediction }) {
 // dari dose/yield/time recipe (bukan disimpan terpisah), dipakai di mana
 // pun recipe ditampilkan. Kalau beda dari shotType yang dipilih user pas
 // dial-in, ditandain biar ketauan ada mismatch.
-function ShotCategoryBadge({ dose, yieldVal, time, intendedShotType, setting, grinder }) {
+function ShotCategoryBadge({ dose, yieldVal, time, intendedShotType, setting, grinder, db, recipe }) {
   const result = classifyShotResult(dose, yieldVal, time);
   if (!result) return null;
   const intended = intendedShotType || "Espresso";
@@ -2877,10 +2900,16 @@ function ShotCategoryBadge({ dose, yieldVal, time, intendedShotType, setting, gr
   // (kartu Percobaan Terakhir, list Recipe, form edit) tanpa nambah state.
   let altText = "";
   if (flagged && grinder) {
-    const suggestion = suggestNextGrindShift(result, intended, grinder);
     const base = parseFloat(setting);
-    if (suggestion && !isNaN(base)) {
-      const delta = suggestion.direction === "finer" ? -suggestion.stepDelta : suggestion.stepDelta;
+    let delta = null;
+    if (db && recipe) {
+      const g = computeGrindDelta(db, recipe, intended, grinder, result);
+      if (g) delta = g.delta;
+    } else {
+      const suggestion = suggestNextGrindShift(result, intended, grinder);
+      if (suggestion) delta = suggestion.direction === "finer" ? -suggestion.stepDelta : suggestion.stepDelta;
+    }
+    if (delta != null && !isNaN(base)) {
       const alt = Math.round(clampToSafeMin(roundToStep(base + delta, grinder), grinder) * 100) / 100;
       altText = ` → coba ~${alt} kalau mau ngejar ${intended} murni`;
     }
@@ -2955,6 +2984,8 @@ function LastTrialCard({ db, beanId, grinderId, machineId }) {
           intendedShotType={r.shotType}
           setting={r.setting}
           grinder={db.grinders.find((g) => g.id === grinderId)}
+          db={db}
+          recipe={r}
         />
       </div>
       {tasteLine && <div className="text-sm mt-0.5" style={{ color: "#2A2118" }}>{tasteLine}</div>}
@@ -3018,6 +3049,8 @@ function FullTrialHistory({ db, beanId, grinderId, machineId }) {
                     intendedShotType={r.shotType}
                     setting={r.setting}
                     grinder={db.grinders.find((g) => g.id === grinderId)}
+                    db={db}
+                    recipe={r}
                   />
                 </div>
                 {tasteLine && <div className="text-xs mt-1" style={{ color: "#2A2118" }}>{tasteLine}</div>}
@@ -4806,6 +4839,8 @@ function ItemForm({ tabKey, db, initial, onCancel, onSave }) {
               intendedShotType={values.shotType}
               setting={values.setting}
               grinder={db.grinders.find((g) => g.id === values.grinderId)}
+              db={db}
+              recipe={values}
             />
           )}
         </div>
@@ -5014,6 +5049,8 @@ function ShotHistoryPanel({ db, persist, onEdit }) {
                     intendedShotType={r.shotType}
                     setting={r.setting}
                     grinder={db.grinders.find((g) => g.id === r.grinderId)}
+                    db={db}
+                    recipe={r}
                   />
                 </div>
                 {r.notes && (
