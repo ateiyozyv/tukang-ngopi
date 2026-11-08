@@ -236,42 +236,56 @@ const DEFAULT_BURR_SHIFT = 4;
 // Bobot angka awal saat dicampur dengan hasil belajar: setara 2 pasang data.
 const BURR_SHIFT_PRIOR_WEIGHT = 2;
 
+// Belajar selisih antar-inner-burr dari data sendiri. Patokannya: trial yang
+// WAKTU ekstraksinya masuk rentang jenis shot-nya (mis. Espresso 25–30 dtk) —
+// bukan yang rating/default-nya tinggi. Alasannya: waktu yang pas itu ukuran
+// objektif "setting ini setara", sedangkan rating bisa dipengaruhi hal lain
+// (selera, bean yang menua). Untuk tiap bean+jenis shot+kelompok dose, rata-rata
+// setting yang waktunya pas di burr lama dibandingkan dengan di burr sekarang.
 function learnedBurrShift(db, grinder) {
   const cur = burrKey(grinder?.innerBurr);
   const curNum = parseFloat(cur);
   if (!cur || isNaN(curNum)) return null;
-  const otherBurrs = [
-    ...new Set(
-      db.recipes
-        .filter((r) => r.grinderId === grinder.id && burrKey(r.innerBurr) !== "" && burrKey(r.innerBurr) !== cur)
-        .map((r) => burrKey(r.innerBurr))
-    ),
-  ];
+  const inRange = (r) => {
+    const range = SHOT_TIME_RANGE[r.shotType || "Espresso"];
+    const t = parseFloat(r.time);
+    return !!range && !isNaN(t) && t >= range[0] && t <= range[1];
+  };
+  const doseBucket = (r) => {
+    const d = parseFloat(r.dose);
+    return isNaN(d) ? null : d < 14 ? "single" : "double";
+  };
+  const groups = {}; // key: bean|shot|bucket|burr → [setting]
+  db.recipes.forEach((r) => {
+    if (r.grinderId !== grinder.id) return;
+    const burr = burrKey(r.innerBurr);
+    const setting = parseFloat(r.setting);
+    const bucket = doseBucket(r);
+    if (!burr || isNaN(setting) || !bucket || !inRange(r)) return;
+    const key = [r.beanId, r.shotType || "Espresso", bucket, burr].join("|");
+    (groups[key] = groups[key] || []).push(setting);
+  });
+  const mean = (arr) => arr.reduce((x, y) => x + y, 0) / arr.length;
   const values = [];
-  const dbCur = { ...db, recipes: db.recipes.filter((r) => burrKey(r.innerBurr) === cur) };
-  otherBurrs.forEach((ob) => {
-    const obNum = parseFloat(ob);
-    if (isNaN(obNum)) return;
-    const dbOld = { ...db, recipes: db.recipes.filter((r) => burrKey(r.innerBurr) === ob) };
-    db.beans.forEach((bean) => {
-      const rOld = findBestRecipe(dbOld, bean.id, grinder.id);
-      const rNew = findBestRecipe(dbCur, bean.id, grinder.id);
-      if (!rOld || !rNew) return;
-      const good = (r) => r.isDefault || (r.rating != null && r.rating !== "" && Number(r.rating) >= 9);
-      if (!good(rOld) || !good(rNew)) return;
-      if ((rOld.shotType || "Espresso") !== (rNew.shotType || "Espresso")) return;
-      const dOld = parseFloat(rOld.dose);
-      const dNew = parseFloat(rNew.dose);
-      if (isNaN(dOld) || isNaN(dNew) || Math.abs(dOld - dNew) > 2) return;
-      const sOld = parseFloat(rOld.setting);
-      const sNew = parseFloat(rNew.setting);
-      if (isNaN(sOld) || isNaN(sNew)) return;
-      const v = (sNew - sOld) / (obNum - curNum);
+  Object.keys(groups).forEach((key) => {
+    const [beanId, shot, bucket, burr] = key.split("|");
+    if (burr !== cur) return;
+    const obNumSet = new Set(
+      Object.keys(groups)
+        .map((k) => k.split("|"))
+        .filter((k) => k[0] === beanId && k[1] === shot && k[2] === bucket && k[3] !== cur)
+        .map((k) => k[3])
+    );
+    obNumSet.forEach((ob) => {
+      const obNum = parseFloat(ob);
+      if (isNaN(obNum) || obNum === curNum) return;
+      const oldArr = groups[[beanId, shot, bucket, ob].join("|")];
+      const v = (mean(groups[key]) - mean(oldArr)) / (obNum - curNum);
       if (isFinite(v) && v >= 0) values.push(v);
     });
   });
   if (values.length === 0) return null;
-  return { sum: values.reduce((a, b) => a + b, 0), count: values.length };
+  return { sum: values.reduce((x, y) => x + y, 0), count: values.length };
 }
 
 function burrShiftPerStep(db, grinder) {
@@ -308,8 +322,12 @@ function findBestRecipe(db, beanId, grinderId, machineId, shotType, targetDose, 
     });
     if (doseMatched.length > 0) matches = doseMatched;
   }
-  const marked = matches.find((r) => r.isDefault);
-  if (marked) return marked;
+  // Kalau ada beberapa yang ditandai default (data lama bisa dobel), pakai
+  // yang paling BARU — bukan "yang kebetulan pertama ketemu di array".
+  const markedList = matches.filter((r) => r.isDefault);
+  if (markedList.length > 0) {
+    return markedList.slice().sort((a, b) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime())[0];
+  }
   // Kalau ada yang udah beneran kebukti enak (rating ≥9), itu paling bisa
   // dipercaya sebagai "jawaban terbaik sejauh ini" — walau belum ditandai
   // default secara eksplisit.
@@ -549,7 +567,7 @@ function applyDeviationNudge(prediction, db, grinder) {
 // waktu-per-setting dari data bean itu sendiri jauh lebih bisa dipercaya.
 // Butuh minimal 2 titik data dengan setting BEDA biar bisa ditarik garis;
 // kalau belum cukup, balikin null (caller fallback ke estimasi flat 1 step).
-function estimateLocalTimePerStep(db, beanId, grinderId, machineId, shotType, refDose, burr) {
+function estimateLocalTimePerStep(db, beanId, grinderId, machineId, shotType, refDose, burr, anchorDate) {
   // Setting luar di inner burr berbeda TIDAK setara — jangan dicampur dalam
   // satu garis tren (kalau dicampur, kemiringannya jadi landai palsu dan
   // saran geser meleset jauh).
@@ -562,6 +580,15 @@ function estimateLocalTimePerStep(db, beanId, grinderId, machineId, shotType, re
         r.machineId === machineId &&
         (r.shotType || "Espresso") === shotType
     )
+    .filter((r) => {
+      // Bean menua dari hari ke hari (aliran makin cepat) — trial yang jauh
+      // di belakang percobaan acuan nggak sebanding lagi, jangan dicampur.
+      if (anchorDate == null) return true;
+      const a = new Date(anchorDate).getTime();
+      const t = new Date(r.date || 0).getTime();
+      if (isNaN(a) || isNaN(t)) return true;
+      return t <= a + 60000 && a - t <= 14 * 24 * 3600 * 1000;
+    })
     .map((r) => ({ x: parseFloat(r.setting), y: parseFloat(r.time), dose: parseFloat(r.dose) }))
     .filter((p) => !isNaN(p.x) && !isNaN(p.y));
 
@@ -578,7 +605,8 @@ function estimateLocalTimePerStep(db, beanId, grinderId, machineId, shotType, re
   const pool = refDose != null && !isNaN(refDose) ? filtered : points;
 
   const distinctX = new Set(pool.map((p) => p.x));
-  if (pool.length < 2 || distinctX.size < 2) return null;
+  // Butuh ≥3 trial (2 titik selalu pas membentuk garis, nggak bukti apa-apa).
+  if (pool.length < 3 || distinctX.size < 2) return null;
 
   const n = pool.length;
   const meanX = pool.reduce((s, p) => s + p.x, 0) / n;
@@ -594,7 +622,13 @@ function estimateLocalTimePerStep(db, beanId, grinderId, machineId, shotType, re
   // nggak bisa dipercaya sama sekali, mending dianggap nggak ada data
   // daripada dipakai kebalik arah.
   if (!isFinite(secondsPerUnit) || secondsPerUnit >= 0) return null;
-  return { secondsPerUnit, count: n };
+  // Seberapa cocok garisnya ke data (R²). Waktu ekstraksi itu berisik (puck,
+  // basket, retained coffee, bean menua) — kalau garisnya cuma menjelaskan
+  // <40% variasi, itu bukan tren, jangan dipakai buat ngitung geser.
+  const ssTot = pool.reduce((sum, p) => sum + (p.y - meanY) * (p.y - meanY), 0);
+  const r2 = ssTot === 0 ? 0 : (num * num) / (den * ssTot);
+  if (!isFinite(r2) || r2 < 0.4) return null;
+  return { secondsPerUnit, count: n, r2 };
 }
 
 // SATU-SATUNYA tempat yang menghitung "geser berapa" setelah sebuah hasil
@@ -612,16 +646,18 @@ function computeGrindDelta(db, recipe, targetShotType, grinder, result) {
   let basis = null;
 
   const local = estimateLocalTimePerStep(
-    db, recipe.beanId, recipe.grinderId, recipe.machineId, targetShotType, parseFloat(recipe.dose), burr
+    db, recipe.beanId, recipe.grinderId, recipe.machineId, targetShotType, parseFloat(recipe.dose), burr, recipe.date
   );
   if (local && range && !isNaN(actualTime)) {
     const targetTime = actualTime < range[0] ? range[0] : actualTime > range[1] ? range[1] : null;
     if (targetTime != null) {
       const rawDelta = (targetTime - actualTime) / local.secondsPerUnit;
-      // Sanity cap: kalau slope-nya kebetulan nyaris flat dan hasilnya minta
-      // geser >8 step sekaligus, itu nggak masuk akal — balik ke flat.
-      if (isFinite(rawDelta) && Math.abs(rawDelta) / step <= 8) {
-        delta = rawDelta;
+      // Batas geser per percobaan: maksimum 3 step sekaligus. Lebih dari itu
+      // hampir selalu tanda garis tren yang nggak bisa dipercaya — dipotong
+      // ke 3 step, bukan lompat jauh.
+      if (isFinite(rawDelta)) {
+        const maxShift = 3 * step;
+        delta = Math.max(-maxShift, Math.min(maxShift, rawDelta));
         basis = { count: local.count };
       }
     }
@@ -638,8 +674,63 @@ function predictSetting(db, beanId, grinderId, machineId, shotType, targetDose) 
 
   // Tahap 0: exact match buat jenis shot ini persis.
   const curBurr = burrKey(targetGrinder?.innerBurr);
-  const exact = findBestRecipe(db, beanId, grinderId, machineId, shotType, targetDose, curBurr);
-  if (exact) {
+  const exact0 = findBestRecipe(db, beanId, grinderId, machineId, shotType, targetDose, curBurr);
+  if (exact0) {
+    // Default itu PENANDA rasa enak, bukan kunci. Percobaan yang LEBIH BARU
+    // (bean/grinder/mesin/jenis shot/inner burr sama, dose ±2g) bisa
+    // membantahnya lewat logika fisik giling:
+    //  - di setting lebih halus/sama sudah terlalu cepat → setting default
+    //    (lebih kasar) pasti juga terlalu cepat;
+    //  - di setting lebih kasar/sama sudah terlalu lambat → default (lebih
+    //    halus) pasti juga terlalu lambat.
+    // Kalau percobaan terbaru justru bagus (rating ≥9), itu yang jadi
+    // jawaban baru. Kalau default dibantah, saran dihitung dari percobaan
+    // terbaru, bukan dari default lama.
+    let exact = exact0;
+    let superseded = null;
+    {
+      const t0 = exact0.shotType || "Espresso";
+      const rng = SHOT_TIME_RANGE[t0];
+      const d0 = parseFloat(exact0.dose);
+      const s0 = parseFloat(exact0.setting);
+      const time0 = new Date(exact0.date || 0).getTime();
+      const good = (r) => r.rating != null && r.rating !== "" && Number(r.rating) >= 9;
+      const newer = db.recipes
+        .filter(
+          (r) =>
+            r.id !== exact0.id &&
+            r.beanId === beanId &&
+            r.grinderId === grinderId &&
+            r.machineId === machineId &&
+            (r.shotType || "Espresso") === t0 &&
+            recipeMatchesBurr(r, curBurr) &&
+            new Date(r.date || 0).getTime() > time0 &&
+            !isNaN(parseFloat(r.setting)) &&
+            (isNaN(d0) || (!isNaN(parseFloat(r.dose)) && Math.abs(parseFloat(r.dose) - d0) <= 2))
+        )
+        .sort((x, y) => new Date(x.date || 0).getTime() - new Date(y.date || 0).getTime());
+      if (newer.length > 0 && !isNaN(s0)) {
+        const latest = newer[newer.length - 1];
+        if (good(latest)) {
+          if (parseFloat(latest.setting) !== s0) {
+            superseded = { setting: exact0.setting, date: exact0.date, better: true };
+            exact = latest;
+          }
+        } else if (rng) {
+          const contradicts = newer.some((t) => {
+            if (good(t)) return false;
+            const st = parseFloat(t.setting);
+            const tt = parseFloat(t.time);
+            if (isNaN(tt)) return false;
+            return (tt < rng[0] && st <= s0) || (tt > rng[1] && st >= s0);
+          });
+          if (contradicts) {
+            superseded = { setting: exact0.setting, date: exact0.date, better: false };
+            exact = latest;
+          }
+        }
+      }
+    }
     // "Settled" (jangan disaranin geser) ditentuin MURNI dari rating ≥9 —
     // bener-bener enak, terlepas dari kategori shot-nya meleset atau enggak.
     // `isDefault` SENGAJA tidak dipakai buat ini — default cuma berarti
@@ -683,8 +774,8 @@ function predictSetting(db, beanId, grinderId, machineId, shotType, targetDose) 
       }
     }
     return adjustedSetting != null
-      ? { type: "exact", recipe: exact, adjustedSetting, adjustmentBasis }
-      : { type: "exact", recipe: exact };
+      ? { type: "exact", recipe: exact, adjustedSetting, adjustmentBasis, superseded }
+      : { type: "exact", recipe: exact, superseded };
   }
 
   // Tahap 0.25: nggak ada data di inner burr SEKARANG, tapi bean ini pernah
@@ -2899,7 +2990,10 @@ function ShotCategoryBadge({ dose, yieldVal, time, intendedShotType, setting, gr
   // terpisah, jadi otomatis muncul di semua tempat badge ini dipakai
   // (kartu Percobaan Terakhir, list Recipe, form edit) tanpa nambah state.
   let altText = "";
-  if (flagged && grinder) {
+  // Trial yang rating-nya ≥9 itu udah "settled" — jangan disaranin geser,
+  // biar konsisten sama kartu prediksi di atas.
+  const settledTrial = recipe && recipe.rating != null && recipe.rating !== "" && Number(recipe.rating) >= 9;
+  if (flagged && grinder && !settledTrial) {
     const base = parseFloat(setting);
     let delta = null;
     if (db && recipe) {
@@ -3119,8 +3213,15 @@ function computePredictionDisplay(prediction, targetDose, grinder) {
             : " — estimasi 1 step (rasio/waktu belum cukup buat dihitung presisi)"
         }`
       : null;
+  const supersededText = prediction?.superseded
+    ? `⭐ Default lama (setting ${prediction.superseded.setting}${
+        prediction.superseded.date
+          ? ", " + new Date(prediction.superseded.date).toLocaleDateString("id-ID", { day: "numeric", month: "short" })
+          : ""
+      }) ${prediction.superseded.better ? "digantikan percobaan terbaru yang lebih bagus" : "sudah dibantah percobaan terbaru"}`
+    : null;
   const doseAdjustText = doseAdjusted != null ? `Setting disesuaikan dari data dose ${prediction.recipe.dose}g ke target ~${targetDose}g` : null;
-  return { exactBaseSetting, doseAdjusted, displaySetting, doseAdjustText, geserText };
+  return { exactBaseSetting, doseAdjusted, displaySetting, doseAdjustText, geserText, supersededText };
 }
 
 function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
@@ -3148,7 +3249,7 @@ function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
   // dari dose target ukuran yang dipilih, geser settingnya sesuai
   // kalibrasi dose→step. Bridge/rough/adjusted dilewati karena nggak ada
   // dose baseline yang jelas buat jadi patokan geser.
-  const { exactBaseSetting, doseAdjusted, doseAdjustText, geserText } = computePredictionDisplay(prediction, targetDose, grinder);
+  const { exactBaseSetting, doseAdjusted, doseAdjustText, geserText, supersededText } = computePredictionDisplay(prediction, targetDose, grinder);
 
   // Kalau recipe yang lagi ditampilkan dicatat waktu inner burr grinder ini
   // masih di posisi beda dari sekarang, settingnya kemungkinan udah nggak
@@ -3445,6 +3546,11 @@ function BikinKopiScreen({ db, persist, onBack, onGoDatabase }) {
                     style={{ backgroundColor: "#F5E6D8", color: "#B8763C" }}
                   >
                     📐 {geserText}
+                  </div>
+                )}
+                {supersededText && (
+                  <div className="text-[11px] mt-2" style={{ color: "#736657" }}>
+                    {supersededText}
                   </div>
                 )}
                 {doseAdjusted == null && prediction.type === "exact" && prediction.recipe.status === "Experiment" && (
@@ -3834,7 +3940,7 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
     beanId && grinderId && machineId && shotType ? predictSetting(db, beanId, grinderId, machineId, shotType, targetDose) : null;
   const availableBeans = sortBeansByRecentActivity(db, db.beans.filter((b) => !b.outOfStock));
   const shotTypeTags = bean ? suggestShotTypeTags(bean) : {};
-  const { exactBaseSetting, doseAdjusted, doseAdjustText, geserText } = computePredictionDisplay(prediction, targetDose, grinder);
+  const { exactBaseSetting, doseAdjusted, doseAdjustText, geserText, supersededText } = computePredictionDisplay(prediction, targetDose, grinder);
   const innerBurrMismatch =
     prediction?.type === "exact" &&
     grinder?.innerBurr &&
@@ -4113,6 +4219,11 @@ function DialInScreen({ db, persist, onBack, onGoDatabase }) {
                 <div className="text-xs mt-1" style={{ color: "#6B6058" }}>
                   {doseAdjustText || geserText || "Setting terbaik yang tercatat"}
                 </div>
+                {supersededText && (
+                  <div className="text-[11px] mt-1" style={{ color: "#736657" }}>
+                    {supersededText}
+                  </div>
+                )}
                 {innerBurrMismatch && (
                   <div
                     className="inline-flex items-center gap-1.5 mt-2 rounded-full text-xs px-3 py-1.5"
