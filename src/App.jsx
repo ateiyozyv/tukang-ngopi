@@ -631,11 +631,162 @@ function estimateLocalTimePerStep(db, beanId, grinderId, machineId, shotType, re
   return { secondsPerUnit, count: n, r2 };
 }
 
+// Laju aliran ternormalisasi = (yield ÷ dose) ÷ detik. Beda dengan waktu/rasio
+// mentah, ini tidak terpengaruh kapan shot DIHENTIKAN, dan shot yang enak
+// (rating ≥9) di grinder yang sama punya angka yang hampir sama antar bean
+// (Breville burr 3 ≈ 0,085) — yang beda antar bean hanya SETTING yang
+// menghasilkannya. Trial gagal (yield/waktu 0) dikeluarkan.
+function shotFlow(r) {
+  const d = parseFloat(r.dose);
+  const y = parseFloat(r.yield);
+  const t = parseFloat(r.time);
+  if (!(d > 0) || !(y > 0) || !(t > 0)) return null;
+  return y / d / t;
+}
+
+function medianOf(arr) {
+  if (!arr.length) return null;
+  const a = [...arr].sort((x, y) => x - y);
+  const m = Math.floor(a.length / 2);
+  return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+}
+
+// Laju aliran target: median shot rating ≥9 di grinder+inner burr+jenis shot
+// yang sama (≥3 shot); kalau belum ada, dari titik tengah rasio ÷ waktu jenis
+// shot-nya.
+function targetFlowFor(db, grinderId, burr, shotType) {
+  const good = db.recipes
+    .filter(
+      (r) =>
+        r.grinderId === grinderId &&
+        (r.shotType || "Espresso") === shotType &&
+        recipeMatchesBurr(r, burr) &&
+        r.rating != null && r.rating !== "" && Number(r.rating) >= 9
+    )
+    .map(shotFlow)
+    .filter((f) => f != null);
+  if (good.length >= 3) return { value: medianOf(good), learned: true, count: good.length };
+  const rr = SHOT_RATIO_RANGE[shotType];
+  const tr = SHOT_TIME_RANGE[shotType];
+  if (!rr || !tr) return null;
+  return { value: (rr[0] + rr[1]) / 2 / ((tr[0] + tr[1]) / 2), learned: false, count: 0 };
+}
+
+// Regresi laju aliran vs setting. Setting lebih kasar HARUS membuat laju naik
+// (slope positif); R² ≥0.4, ≥3 trial, ≥2 setting berbeda.
+function flowRegression(points) {
+  const pool = points.filter((p) => p.f != null && !isNaN(p.x));
+  const distinct = new Set(pool.map((p) => p.x));
+  if (pool.length < 3 || distinct.size < 2) return null;
+  const n = pool.length;
+  const mx = pool.reduce((s, p) => s + p.x, 0) / n;
+  const my = pool.reduce((s, p) => s + p.f, 0) / n;
+  const num = pool.reduce((s, p) => s + (p.x - mx) * (p.f - my), 0);
+  const den = pool.reduce((s, p) => s + (p.x - mx) * (p.x - mx), 0);
+  const ssTot = pool.reduce((s, p) => s + (p.f - my) * (p.f - my), 0);
+  if (den === 0 || ssTot === 0) return null;
+  const slope = num / den;
+  const r2 = (num * num) / (den * ssTot);
+  if (!isFinite(slope) || slope <= 0 || r2 < 0.4) return null;
+  return { slope, r2, count: n };
+}
+
+// Kemiringan acuan: median kemiringan laju-per-setting dari bean LAIN di
+// grinder+inner burr+jenis shot yang sama (min 2 bean punya garis valid).
+function flowSlopePrior(db, grinderId, burr, shotType, excludeBeanId) {
+  const byBean = {};
+  db.recipes.forEach((r) => {
+    if (
+      r.beanId === excludeBeanId ||
+      r.grinderId !== grinderId ||
+      (r.shotType || "Espresso") !== shotType ||
+      !recipeMatchesBurr(r, burr)
+    )
+      return;
+    const f = shotFlow(r);
+    const x = parseFloat(r.setting);
+    if (f == null || isNaN(x)) return;
+    (byBean[r.beanId] = byBean[r.beanId] || []).push({ x, f });
+  });
+  const slopes = Object.values(byBean).map(flowRegression).filter(Boolean).map((g) => g.slope);
+  if (slopes.length < 2) return null;
+  return { slope: medianOf(slopes), beans: slopes.length };
+}
+
+// Geser setting dari laju aliran (interpolasi). Urutan: (1) interpolasi di
+// antara dua trial bean ini yang mengapit laju target (hanya kalau urutan
+// setting-nya konsisten); (2) regresi laju-vs-setting bean ini; (3)
+// kemiringan median bean lain. Batas geser sekali jalan: maks 2 step ke arah
+// lebih kasar, maks 1 step ke arah lebih halus.
+function computeFlowDelta(db, recipe, targetShotType, grinder, burr) {
+  const f0 = shotFlow(recipe);
+  const x0 = parseFloat(recipe.setting);
+  if (f0 == null || isNaN(x0)) return null;
+  const tf = targetFlowFor(db, recipe.grinderId, burr, targetShotType);
+  if (!tf || !(tf.value > 0)) return null;
+  // Sudah dekat target → bukan urusan giling, biarkan logika lain yang menilai.
+  if (Math.abs(f0 - tf.value) / tf.value < 0.15) return null;
+  const step = parseFloat(grinder?.stepSize) || 1;
+  const anchor = recipe.date ? new Date(recipe.date).getTime() : null;
+  const local = db.recipes
+    .filter(
+      (r) =>
+        r.beanId === recipe.beanId &&
+        r.grinderId === recipe.grinderId &&
+        r.machineId === recipe.machineId &&
+        (r.shotType || "Espresso") === targetShotType &&
+        recipeMatchesBurr(r, burr)
+    )
+    .filter((r) => {
+      if (anchor == null || isNaN(anchor)) return true;
+      const t = new Date(r.date || 0).getTime();
+      return isNaN(t) || (t <= anchor + 60000 && anchor - t <= 14 * 24 * 3600 * 1000);
+    })
+    .map((r) => ({ x: parseFloat(r.setting), f: shotFlow(r) }))
+    .filter((p) => p.f != null && !isNaN(p.x));
+
+  let delta = null;
+  let cap = 2 * step;
+  let source = null;
+  let count = local.length;
+
+  const lows = local.filter((p) => p.f < tf.value).sort((a, b) => b.f - a.f);
+  const highs = local.filter((p) => p.f > tf.value).sort((a, b) => a.f - b.f);
+  const lo = lows[0];
+  const hi = highs[0];
+  if (lo && hi && hi.x > lo.x) {
+    const target = lo.x + ((tf.value - lo.f) / (hi.f - lo.f)) * (hi.x - lo.x);
+    delta = target - x0;
+    source = "interpolasi";
+  }
+  if (delta == null) {
+    const reg = flowRegression(local);
+    if (reg) {
+      delta = (tf.value - f0) / reg.slope;
+      source = "regresi";
+      count = reg.count;
+    }
+  }
+  if (delta == null) {
+    const prior = flowSlopePrior(db, recipe.grinderId, burr, targetShotType, recipe.beanId);
+    if (prior) {
+      delta = (tf.value - f0) / prior.slope;
+      source = "bean lain";
+      count = prior.beans;
+    }
+  }
+  if (delta == null || !isFinite(delta)) return null;
+  // Shot terlalu cepat sering cuma channeling/shot pertama pagi (bukan giling
+  // yang kasar betulan), dan kelewat halus berisiko tersumbat — jadi arah
+  // lebih halus dibatasi lebih ketat daripada arah lebih kasar.
+  delta = Math.max(-step, Math.min(cap, delta));
+  return { delta, basis: { count, method: "flow", source, targetFlow: tf.value } };
+}
+
 // SATU-SATUNYA tempat yang menghitung "geser berapa" setelah sebuah hasil
 // meleset dari target shot — dipakai kartu prediksi DAN badge saran di
-// "Percobaan Terakhir"/riwayat, supaya angkanya selalu sama. Pertama coba
-// tren waktu lokal (bean+grinder+mesin+jenis shot+dose+inner burr yang
-// sama); kalau belum cukup data, jatuh ke estimasi 1 step.
+// "Percobaan Terakhir"/riwayat, supaya angkanya selalu sama. Urutan: laju
+// aliran (interpolasi); tren waktu lokal; terakhir estimasi 1 step.
 function computeGrindDelta(db, recipe, targetShotType, grinder, result) {
   if (!result || !recipe || !grinder) return null;
   const step = parseFloat(grinder?.stepSize) || 1;
@@ -645,6 +796,16 @@ function computeGrindDelta(db, recipe, targetShotType, grinder, result) {
   let delta = null;
   let basis = null;
 
+  // Laju aliran cuma menentukan BESARNYA geser. Perlu-tidaknya dan ARAH-nya
+  // tetap dari aturan waktu/rasio (toleransi 10%) — shot yang waktunya pas dan
+  // yield-nya cuma sedikit meleset bukan alasan menggeser giling. Kalau
+  // hitungan laju berlawanan arah dengan aturan itu, dibuang.
+  const sug = suggestNextGrindShift(result, targetShotType, grinder);
+  if (sug) {
+    const fl = computeFlowDelta(db, recipe, targetShotType, grinder, burr);
+    if (fl && (sug.direction === "finer" ? fl.delta < 0 : fl.delta > 0)) return { delta: fl.delta, basis: fl.basis };
+  }
+
   const local = estimateLocalTimePerStep(
     db, recipe.beanId, recipe.grinderId, recipe.machineId, targetShotType, parseFloat(recipe.dose), burr, recipe.date
   );
@@ -652,9 +813,6 @@ function computeGrindDelta(db, recipe, targetShotType, grinder, result) {
     const targetTime = actualTime < range[0] ? range[0] : actualTime > range[1] ? range[1] : null;
     if (targetTime != null) {
       const rawDelta = (targetTime - actualTime) / local.secondsPerUnit;
-      // Batas geser per percobaan: maksimum 3 step sekaligus. Lebih dari itu
-      // hampir selalu tanda garis tren yang nggak bisa dipercaya — dipotong
-      // ke 3 step, bukan lompat jauh.
       if (isFinite(rawDelta)) {
         const maxShift = 3 * step;
         delta = Math.max(-maxShift, Math.min(maxShift, rawDelta));
@@ -711,7 +869,12 @@ function predictSetting(db, beanId, grinderId, machineId, shotType, targetDose) 
         .sort((x, y) => new Date(x.date || 0).getTime() - new Date(y.date || 0).getTime());
       if (newer.length > 0 && !isNaN(s0)) {
         const latest = newer[newer.length - 1];
-        if (good(latest)) {
+        // Percobaan terbaru yang enak (rating ≥9) hanya menggantikan default
+        // yang SENDIRI belum terbukti enak (rating <9/kosong). Default yang
+        // rating-nya sudah ≥9 itu pilihan sadar pemakai — nggak boleh
+        // diganti cuma karena ada percobaan lain yang juga enak; baru
+        // goyang kalau DIBANTAH lewat logika fisik di bawah.
+        if (good(latest) && !good(exact0)) {
           if (parseFloat(latest.setting) !== s0) {
             superseded = { setting: exact0.setting, date: exact0.date, better: true };
             exact = latest;
@@ -3016,7 +3179,9 @@ function ShotCategoryBadge({ dose, yieldVal, time, intendedShotType, setting, gr
         color: flagged ? "#B8632E" : "#1F7A4C",
       }}
     >
-      {result.conflict
+      {result.ratio != null && result.ratio < 0.8
+        ? `⚠️ Shot tersumbat / yield sangat kecil (rasio ~1:${Math.round(result.ratio * 100) / 100}) — giling kemungkinan terlalu halus${altText}`
+        : result.conflict
         ? `⚠️ Waktu mirip ${result.timeCategory}, tapi rasio (~1:${Math.round(result.ratio * 100) / 100}) mirip ${result.ratioCategory || "kategori lain"} — kemungkinan aliran nggak wajar${altText}`
         : `Hasil: ${result.category}${mismatch ? ` (dipilih: ${intended})` : ""}${altText}`}
     </span>
@@ -3209,7 +3374,11 @@ function computePredictionDisplay(prediction, targetDose, grinder) {
     isExact && prediction.adjustedSetting != null
       ? `Digeser dari ${prediction.recipe.setting}${
           prediction.adjustmentBasis
-            ? ` — dihitung dari ${prediction.adjustmentBasis.count} trial bean ini`
+            ? prediction.adjustmentBasis.method === "flow"
+              ? prediction.adjustmentBasis.source === "bean lain"
+                ? ` — dihitung dari laju aliran (kemiringan rata-rata ${prediction.adjustmentBasis.count} bean lain di grinder ini)`
+                : ` — dihitung dari laju aliran ${prediction.adjustmentBasis.count} trial bean ini (${prediction.adjustmentBasis.source})`
+              : ` — dihitung dari ${prediction.adjustmentBasis.count} trial bean ini`
             : " — estimasi 1 step (rasio/waktu belum cukup buat dihitung presisi)"
         }`
       : null;
@@ -3884,6 +4053,10 @@ function classifyShotResult(dose, yieldVal, time) {
 function suggestNextGrindShift(result, targetShotType, grinder) {
   if (!result) return null;
   const step = parseFloat(grinder?.stepSize) || 1;
+  // Yield nyaris nol (rasio <1:0,8) = shot tersumbat/nggak keluar → giling
+  // pasti terlalu halus, apa pun waktu yang tercatat (waktu itu cuma kapan
+  // pemakai berhenti).
+  if (result.ratio != null && result.ratio < 0.8) return { direction: "coarser", stepDelta: step };
   const timeRange = SHOT_TIME_RANGE[targetShotType];
   const t = parseFloat(result.time);
   if (timeRange && !isNaN(t)) {
@@ -3892,8 +4065,13 @@ function suggestNextGrindShift(result, targetShotType, grinder) {
   }
   const ratioRange = SHOT_RATIO_RANGE[targetShotType];
   if (ratioRange && result.ratio != null) {
-    if (result.ratio > ratioRange[1]) return { direction: "finer", stepDelta: step };
-    if (result.ratio < ratioRange[0]) return { direction: "coarser", stepDelta: step };
+    // Rasio itu sebagian besar ditentukan kapan shot DISTOP (yield), bukan
+    // gilingan. Jadi cuma dianggap masalah giling kalau jauh di luar rentang
+    // (>10%). Kalau waktunya sudah di dalam rentang dan rasio cuma sedikit
+    // di luar batas, itu bukan alasan menggeser giling.
+    if (result.ratio > ratioRange[1] * 1.1) return { direction: "finer", stepDelta: step };
+    if (result.ratio < ratioRange[0] * 0.9) return { direction: "coarser", stepDelta: step };
+    if (result.ratio > ratioRange[1] || result.ratio < ratioRange[0]) return null;
   }
   // Fungsi ini CUMA pernah dipanggil kalau hasilnya udah ketauan bermasalah
   // (conflict/mismatch) dari pengecekan sebelumnya, jadi nggak perlu lagi
